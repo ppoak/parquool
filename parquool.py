@@ -232,7 +232,7 @@ def notify_task(
     password = password or os.getenv("NOTIFY_TASK_PASSWORD")
     receiver = receiver or os.getenv("NOTIFY_TASK_RECEIVER")
     smtp_server = smtp_server or os.getenv("NOTIFY_TASK_SMTP_SERVER")
-    smtp_port = smtp_server or os.getenv("NOTIFY_TASK_SMTP_PORT")
+    smtp_port = smtp_port or os.getenv("NOTIFY_TASK_SMTP_PORT")
     cc = cc or os.getenv("NOTIFY_TASK_CC")
 
     def wrapper(task):
