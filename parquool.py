@@ -1138,7 +1138,7 @@ class DuckParquet:
         self.refresh()
 
 
-class Agent:
+class BaseAgent:
     """High-level wrapper around the internal `agents.Agent` providing conveniences
     for initialization, running, streaming, and CLI integration.
 
