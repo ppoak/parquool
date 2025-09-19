@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import shutil
+import subprocess
 import time
 import traceback
 import uuid
@@ -1155,11 +1156,12 @@ class Agent:
         base_url: str = None,
         api_key: str = None,
         name: str = "pqagent",
-        log_file: str = "pqagent.log",
+        log_file: str = None,
         log_level: str = "INFO",
         model_name: str = None,
         model_settings: dict = None,
         instructions: str = "You are a helpful assistant.",
+        preset_prompts: dict = None,
         tools: list[agents.Tool] = None,
         tool_use_behavior: str = "run_llm_again",
         handoffs: list[agents.Agent] = None,
@@ -1188,11 +1190,13 @@ class Agent:
             model_name: Name of the model to use. Falls back to OPENAI_MODEL_NAME env var.
             model_settings: Additional model configuration forwarded to agents.ModelSettings.
             instructions: High-level instructions passed to the underlying agent.
+            preset_prompts: Optional dict of preset prompts for common tasks.
             tools: Optional list of tools available to the agent.
+            tool_use_behavior: Strategy for how tools are used by the agent.
+            handoffs: Optional list of handoff agents.
             output_type: Optional output type annotation for the underlying agent.
             input_guardrails: Optional list of input guardrails.
             output_guardrails: Optional list of output guardrails.
-            tool_use_behavior: Strategy for how tools are used by the agent.
             default_openai_api: Default OpenAI API mode to use (e.g. "chat_completions").
             use_model_training: If True, the OpenAI client is used for tracing/model training.
             trace_disabled: If True, tracing is disabled.
@@ -1224,6 +1228,7 @@ class Agent:
             input_guardrails=input_guardrails or list(),
             output_guardrails=output_guardrails or list(),
         )
+        self.preset_prompts = preset_prompts or dict()
 
     def as_tool(self, tool_name: str, tool_description: str):
         """Expose the underlying agent as a Tool descriptor.
@@ -1332,27 +1337,77 @@ class Agent:
                     )
                 else:
                     pass  # Ignore other event types
+        return result
 
-    async def acli(self, stream: bool = True):
-        """Async entry point for the interactive CLI demo.
+    async def acli(
+        self, stream: bool = True, session_id: str = None, db_path: str = None
+    ):
+        """
+        Asynchronous interactive CLI entrypoint.
 
+        Supports the following commands:
+          - Enter any prompt to ask the Agent a question.
+          - Enter a command starting with `/` to invoke a preset prompt, e.g. `/summarize`.
+          - Enter a command starting with `!` to execute a local shell command, e.g. `!ls`.
+          - Enter `exit` or `quit` to exit the CLI.
+          - Commands starting with `#` are reserved for future knowledge management (not implemented).
         Args:
-            stream: Whether to use streamed output in the demo loop.
+            stream: If True, uses streaming output (async event stream). If False, uses synchronous output.
+            session_id: Optional session ID. If None, generates a random session.
+            db_path: Optional SQLite DB file path. If None, uses in-memory database.
+        Returns:
+            None
+        """
+        session_id = session_id or uuid.uuid4().hex
+        db_path = db_path or ":memory:"
+
+        while True:
+            try:
+                user_input = input(" >>> ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if user_input.strip().lower() in {"exit", "quit"}:
+                break
+            elif user_input.startswith("/"):
+                user_input = user_input[1:].strip()
+                if user_input in self.preset_prompts:
+                    user_input = self.preset_prompts[user_input]
+                else:
+                    print(f"Unknown preset prompt: {user_input}")
+                    continue
+            elif user_input.startswith("#"):
+                pass  # reserved for future knowledge commands
+            elif user_input.startswith("!"):
+                user_input = user_input[1:].strip()
+                subprocess.run(user_input, shell=True)
+                continue
+            elif not user_input:
+                continue
+
+            result: agents.RunResult
+            if stream:
+                result = self.run_streamed(
+                    prompt=user_input, session_id=session_id, db_path=db_path
+                )
+            else:
+                result = await self.run(
+                    prompt=user_input, session_id=session_id, db_path=db_path
+                )
+                if result.final_output is not None:
+                    self.logger.info(result.final_output)
+
+    def cli(self, stream: bool = True, session_id: str = None, db_path: str = None):
+        """
+        Launch interactive CLI (synchronous, blocking main thread).
+
+        This method wraps the asynchronous acli CLI in asyncio.run(), allowing synchronous invocation.
+        Args:
+            stream: If True, uses streaming output.
+            session_id: Optional session ID.
+            db_path: Optional SQLite DB file path.
 
         Returns:
             None
         """
-        await agents.run_demo_loop(self.agent, stream=stream)
-
-    def cli(self, stream: bool = True):
-        """Run the interactive CLI demo synchronously (blocks until finished).
-
-        This method wraps the async `_cli` by running it via asyncio.run.
-
-        Args:
-            stream: Whether to use streamed output in the demo loop.
-
-        Returns:
-            None
-        """
-        asyncio.run(self.acli(stream=stream))
+        asyncio.run(self.acli(stream=stream, session_id=session_id, db_path=db_path))
