@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import shutil
@@ -19,6 +20,9 @@ from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import dotenv
+import agents
+import openai
 import requests
 import markdown
 import duckdb
@@ -1131,3 +1135,224 @@ class DuckParquet:
             if os.path.exists(tmpdir):
                 shutil.rmtree(tmpdir, ignore_errors=True)
         self.refresh()
+
+
+class Agent:
+    """High-level wrapper around the internal `agents.Agent` providing conveniences
+    for initialization, running, streaming, and CLI integration.
+
+    This class sets up the OpenAI client and tracing defaults, configures logging,
+    and exposes synchronous, asynchronous, and streamed run methods that use an
+    SQLite-backed session by default.
+
+    Attributes:
+        logger: Logger instance used by the wrapper.
+        agent: Underlying agents.Agent instance that executes prompts and tools.
+    """
+
+    def __init__(
+        self,
+        base_url: str = None,
+        api_key: str = None,
+        name: str = "pqagent",
+        log_file: str = "pqagent.log",
+        log_level: str = "INFO",
+        model_name: str = None,
+        model_settings: dict = None,
+        instructions: str = "You are a helpful assistant.",
+        tools: list[agents.Tool] = None,
+        tool_use_behavior: str = "run_llm_again",
+        handoffs: list[agents.Agent] = None,
+        output_type: str = None,
+        input_guardrails: list[agents.InputGuardrail] = None,
+        output_guardrails: list[agents.OutputGuardrail] = None,
+        default_openai_api: str = "chat_completions",
+        use_model_training: bool = False,
+        trace_disabled: bool = True,
+    ):
+        """Create and configure an Agent wrapper.
+
+        This initializer:
+        - Loads environment variables.
+        - Configures the default OpenAI client and API mode.
+        - Enables/disables tracing.
+        - Sets up logging.
+        - Constructs the underlying agents.Agent with the provided settings.
+
+        Args:
+            base_url: Optional base URL for the OpenAI client. Falls back to OPENAI_BASE_URL env var.
+            api_key: Optional API key for the OpenAI client. Falls back to OPENAI_API_KEY env var.
+            name: Name for this agent wrapper and the underlying agent.
+            log_file: File path to write logs to.
+            log_level: Logging level (e.g. "INFO", "DEBUG").
+            model_name: Name of the model to use. Falls back to OPENAI_MODEL_NAME env var.
+            model_settings: Additional model configuration forwarded to agents.ModelSettings.
+            instructions: High-level instructions passed to the underlying agent.
+            tools: Optional list of tools available to the agent.
+            output_type: Optional output type annotation for the underlying agent.
+            input_guardrails: Optional list of input guardrails.
+            output_guardrails: Optional list of output guardrails.
+            tool_use_behavior: Strategy for how tools are used by the agent.
+            default_openai_api: Default OpenAI API mode to use (e.g. "chat_completions").
+            use_model_training: If True, the OpenAI client is used for tracing/model training.
+            trace_disabled: If True, tracing is disabled.
+
+        Returns:
+            None
+        """
+
+        dotenv.load_dotenv()
+        agents.set_default_openai_client(
+            client=openai.AsyncOpenAI(
+                base_url=base_url or os.getenv("OPENAI_BASE_URL"),
+                api_key=api_key or os.getenv("OPENAI_API_KEY"),
+            ),
+            use_for_tracing=use_model_training,
+        )
+        agents.set_default_openai_api(api=default_openai_api)
+        agents.set_tracing_disabled(disabled=trace_disabled)
+        self.logger = setup_logger(name, file=log_file, level=log_level)
+        self.agent = agents.Agent(
+            name=name,
+            instructions=instructions,
+            output_type=output_type,
+            tools=tools or [],
+            tool_use_behavior=tool_use_behavior,
+            handoffs=handoffs or [],
+            model=model_name or os.getenv("OPENAI_MODEL_NAME"),
+            model_settings=agents.ModelSettings(**model_settings or {}),
+            input_guardrails=input_guardrails or list(),
+            output_guardrails=output_guardrails or list(),
+        )
+
+    def as_tool(self, tool_name: str, tool_description: str):
+        """Expose the underlying agent as a Tool descriptor.
+
+        This is a thin wrapper around agents.Agent.as_tool.
+
+        Args:
+            tool_name: Name to expose for the tool.
+            tool_description: Description of the tool's behavior.
+
+        Returns:
+            A Tool-like descriptor produced by the underlying agent.
+        """
+        return self.agent.as_tool(
+            tool_name=tool_name, tool_description=tool_description
+        )
+
+    def run(self, prompt: str, session_id: str = None, db_path: str = None):
+        """Synchronously run a prompt using the agent within an SQLite-backed session.
+
+        The session defaults to an ephemeral in-memory SQLite DB unless db_path is provided.
+
+        Args:
+            prompt: Prompt text to run.
+            session_id: Optional session identifier. If not provided, a new UUID is generated.
+            db_path: Optional filesystem path for the SQLite DB. Defaults to ":memory:".
+
+        Returns:
+            The result returned by agents.Runner.run (implementation-specific).
+        """
+        return agents.Runner.run(
+            self.agent,
+            prompt,
+            session=agents.SQLiteSession(
+                session_id=session_id or uuid.uuid4().hex, db_path=db_path or ":memory:"
+            ),
+        )
+
+    def run_sync(self, prompt: str, session_id: str = None, db_path: str = None):
+        """Run a prompt synchronously using the agent (blocking).
+
+        This wraps agents.Runner.run_sync and uses an SQLiteSession similar to run().
+
+        Args:
+            prompt: Prompt text to run.
+            session_id: Optional session identifier. If not provided, a new UUID is generated.
+            db_path: Optional filesystem path for the SQLite DB. Defaults to ":memory:".
+
+        Returns:
+            The result returned by agents.Runner.run_sync (implementation-specific).
+        """
+        return agents.Runner.run_sync(
+            self.agent,
+            prompt,
+            session=agents.SQLiteSession(
+                session_id=session_id or uuid.uuid4().hex, db_path=db_path or ":memory:"
+            ),
+        )
+
+    async def run_streamed(
+        self, prompt: str, session_id: str = None, db_path: str = None
+    ):
+        """Run a prompt and process stream events asynchronously.
+
+        The method iterates over the async event stream produced by agents.Runner.run_streamed
+        and logs the important events. It intentionally ignores raw response deltas and only
+        handles agent updates, tool calls, tool outputs, and message outputs.
+
+        Args:
+            prompt: Prompt text to run.
+            session_id: Optional session identifier. If not provided, a new UUID is generated.
+            db_path: Optional filesystem path for the SQLite DB. Defaults to ":memory:".
+
+        Returns:
+            None
+        """
+        session = agents.SQLiteSession(
+            session_id=session_id or uuid.uuid4().hex, db_path=db_path or ":memory:"
+        )
+        result = agents.Runner.run_streamed(
+            self.agent,
+            prompt,
+            session=session,
+        )
+        async for event in result.stream_events():
+            # We'll ignore the raw responses event deltas
+            if event.type == "raw_response_event":
+                continue
+            # When the agent updates, print that
+            elif event.type == "agent_updated_stream_event":
+                self.logger.debug(f"Agent updated: {event.new_agent.name}")
+                continue
+            # When items are generated, print them
+            elif event.type == "run_item_stream_event":
+                if event.item.type == "tool_call_item":
+                    self.logger.info(
+                        f"{'-' * 20} Tool was called: {'-' * 20}\n{event.item.raw_item.name}(arguments: {event.item.raw_item.arguments})"
+                    )
+                elif event.item.type == "tool_call_output_item":
+                    self.logger.info(
+                        f"{'-' * 20} Tool output: {'-' * 20} \n{event.item.output}"
+                    )
+                elif event.item.type == "message_output_item":
+                    self.logger.info(
+                        f"{'-' * 20} Message output: {'-' * 20}\n {agents.ItemHelpers.text_message_output(event.item)}"
+                    )
+                else:
+                    pass  # Ignore other event types
+
+    async def acli(self, stream: bool = True):
+        """Async entry point for the interactive CLI demo.
+
+        Args:
+            stream: Whether to use streamed output in the demo loop.
+
+        Returns:
+            None
+        """
+        await agents.run_demo_loop(self.agent, stream=stream)
+
+    def cli(self, stream: bool = True):
+        """Run the interactive CLI demo synchronously (blocks until finished).
+
+        This method wraps the async `_cli` by running it via asyncio.run.
+
+        Args:
+            stream: Whether to use streamed output in the demo loop.
+
+        Returns:
+            None
+        """
+        asyncio.run(self.acli(stream=stream))
