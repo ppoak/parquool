@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parquool"
-version = "0.0.1"
+version = "0.0.1post1"
 description = "Parquool - A Python Library for SQL like parquet query"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
