@@ -29,6 +29,7 @@ import markdown
 import duckdb
 import pandas as pd
 from retry import retry
+from openai.types.responses import ResponseTextDeltaEvent
 
 
 def setup_logger(
@@ -1216,15 +1217,30 @@ class BaseAgent:
         agents.set_default_openai_api(api=default_openai_api)
         agents.set_tracing_disabled(disabled=trace_disabled)
         self.logger = setup_logger(name, file=log_file, level=log_level)
+
+        handoff_agents = []
+        for handoff in handoffs or []:
+            if not isinstance(handoff, BaseAgent):
+                handoff_agents.append(handoff.agent)
+            elif isinstance(handoff, agents.Agent):
+                handoff_agents.append(handoff)
+            else:
+                raise TypeError("handoffs must be BaseAgent or agents.Agent instances")
+            
+        if isinstance(model_settings, dict):
+            model_settings = agents.ModelSettings(**model_settings)
+        elif not isinstance(model_settings, agents.ModelSettings) and model_settings is not None:
+            raise TypeError("model_settings must be a dict or agents.ModelSettings instance")
+            
         self.agent = agents.Agent(
             name=name,
             instructions=instructions,
             output_type=output_type,
             tools=tools or [],
             tool_use_behavior=tool_use_behavior,
-            handoffs=handoffs or [],
+            handoffs=handoff_agents,
             model=model_name or os.getenv("OPENAI_MODEL_NAME"),
-            model_settings=agents.ModelSettings(**model_settings or {}),
+            model_settings=model_settings,
             input_guardrails=input_guardrails or list(),
             output_guardrails=output_guardrails or list(),
         )
@@ -1315,12 +1331,11 @@ class BaseAgent:
         )
         async for event in result.stream_events():
             # We'll ignore the raw responses event deltas
-            if event.type == "raw_response_event":
-                continue
+            if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+                print(event.data.delta, end="", flush=True)
             # When the agent updates, print that
             elif event.type == "agent_updated_stream_event":
                 self.logger.debug(f"Agent updated: {event.new_agent.name}")
-                continue
             # When items are generated, print them
             elif event.type == "run_item_stream_event":
                 if event.item.type == "tool_call_item":
