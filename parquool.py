@@ -1226,10 +1226,11 @@ class BaseAgent:
                 handoff_agents.append(handoff)
             else:
                 raise TypeError("handoffs must be BaseAgent or agents.Agent instances")
-            
+        
+        model_settings = model_settings or dict()
         if isinstance(model_settings, dict):
             model_settings = agents.ModelSettings(**model_settings)
-        elif not isinstance(model_settings, agents.ModelSettings) and model_settings is not None:
+        elif not isinstance(model_settings, agents.ModelSettings):
             raise TypeError("model_settings must be a dict or agents.ModelSettings instance")
             
         self.agent = agents.Agent(
