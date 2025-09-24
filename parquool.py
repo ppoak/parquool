@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -23,12 +24,15 @@ from email.mime.text import MIMEText
 
 import dotenv
 import agents
+import chromadb
 import openai
 import requests
 import markdown
 import duckdb
+import numpy as np
 import pandas as pd
 from retry import retry
+from chromadb.utils.embedding_functions import EmbeddingFunction
 from openai.types.responses import ResponseTextDeltaEvent
 
 
@@ -1139,7 +1143,7 @@ class DuckParquet:
         self.refresh()
 
 
-class BaseAgent:
+class Agent:
     """High-level wrapper around the internal `agents.Agent` providing conveniences
     for initialization, running, streaming, and CLI integration.
 
@@ -1152,6 +1156,43 @@ class BaseAgent:
         agent: Underlying agents.Agent instance that executes prompts and tools.
     """
 
+    class _ChromaVectorStore:
+        def __init__(self, client, name, embed_fn):
+            self.collection = client.get_or_create_collection(name=name)
+            self.embed_fn = embed_fn
+
+        def __len__(self):
+            try:
+                return self.collection.count()
+            except Exception:
+                return 0
+
+        def add_texts(self, texts, metadatas=None):
+            if metadatas is None:
+                metadatas = [{} for _ in texts]
+            ids = []
+            for i, m in enumerate(metadatas):
+                src = m.get("source", "unknown")
+                idx = m.get("chunk_index", i)
+                ids.append(f"{src}::chunk::{idx}")
+            vecs = self.embed_fn(texts)
+            self.collection.upsert(
+                documents=texts, embeddings=vecs, metadatas=metadatas, ids=ids
+            )
+            return len(texts)
+
+        def search(self, query, k=5):
+            q_emb = self.embed_fn([query])[0]
+            res = self.collection.query(query_embeddings=[q_emb], n_results=k)
+            docs = res.get("documents", [[]])[0]
+            metas = res.get("metadatas", [[]])[0]
+            dists = res.get("distances", [[]])[0]
+            results = []
+            for doc, meta, dist in zip(docs, metas, dists):
+                score = 1.0 - float(dist)
+                results.append((doc, meta, score))
+            return results
+
     def __init__(
         self,
         base_url: str = None,
@@ -1163,15 +1204,24 @@ class BaseAgent:
         model_settings: dict = None,
         instructions: str = "You are a helpful assistant.",
         preset_prompts: dict = None,
-        tools: list[agents.Tool] = None,
+        tools: List[agents.FunctionTool] = None,
         tool_use_behavior: str = "run_llm_again",
-        handoffs: list[agents.Agent] = None,
+        handoffs: List[agents.Agent] = None,
         output_type: str = None,
-        input_guardrails: list[agents.InputGuardrail] = None,
-        output_guardrails: list[agents.OutputGuardrail] = None,
+        input_guardrails: List[agents.InputGuardrail] = None,
+        output_guardrails: List[agents.OutputGuardrail] = None,
         default_openai_api: str = "chat_completions",
         use_model_training: bool = False,
         trace_disabled: bool = True,
+        embedding_model: str = None,
+        default_collection: str = "default",
+        chunk_size: int = 1000,
+        chunk_overlap: int = 200,
+        retrieval_top_k: int = 5,
+        max_context_chars: int = 6000,
+        rag_enabled_by_default: bool = True,
+        rag_prompt_template: str = None,
+        vector_db_path: str = None,
     ):
         """Create and configure an Agent wrapper.
 
@@ -1207,11 +1257,16 @@ class BaseAgent:
         """
 
         dotenv.load_dotenv()
+        self._oai_sync = openai.OpenAI(
+            base_url=base_url or os.getenv("OPENAI_BASE_URL"),
+            api_key=api_key or os.getenv("OPENAI_API_KEY"),
+        )
+        self._oai_async = openai.AsyncOpenAI(
+            base_url=base_url or os.getenv("OPENAI_BASE_URL"),
+            api_key=api_key or os.getenv("OPENAI_API_KEY"),
+        )
         agents.set_default_openai_client(
-            client=openai.AsyncOpenAI(
-                base_url=base_url or os.getenv("OPENAI_BASE_URL"),
-                api_key=api_key or os.getenv("OPENAI_API_KEY"),
-            ),
+            client=self._oai_async,
             use_for_tracing=use_model_training,
         )
         agents.set_default_openai_api(api=default_openai_api)
@@ -1220,24 +1275,37 @@ class BaseAgent:
 
         handoff_agents = []
         for handoff in handoffs or []:
-            if not isinstance(handoff, BaseAgent):
+            if isinstance(handoff, Agent):
                 handoff_agents.append(handoff.agent)
             elif isinstance(handoff, agents.Agent):
                 handoff_agents.append(handoff)
             else:
                 raise TypeError("handoffs must be BaseAgent or agents.Agent instances")
-        
+
+        function_tools = []
+        self.tools = {"save_conversation": self._save_conversation}
+        for fnt in tools or []:
+            if isinstance(fnt, agents.Tool):
+                function_tools.append(fnt)
+            elif callable(fnt):
+                self.tools[fnt.__name__] = fnt
+                function_tools.append(agents.function_tool(fnt))
+            else:
+                raise TypeError("tools must be agents.Tool or callable instances")
+
         model_settings = model_settings or dict()
         if isinstance(model_settings, dict):
             model_settings = agents.ModelSettings(**model_settings)
         elif not isinstance(model_settings, agents.ModelSettings):
-            raise TypeError("model_settings must be a dict or agents.ModelSettings instance")
-            
+            raise TypeError(
+                "model_settings must be a dict or agents.ModelSettings instance"
+            )
+
         self.agent = agents.Agent(
             name=name,
             instructions=instructions,
             output_type=output_type,
-            tools=tools or [],
+            tools=function_tools,
             tool_use_behavior=tool_use_behavior,
             handoffs=handoff_agents,
             model=model_name or os.getenv("OPENAI_MODEL_NAME"),
@@ -1246,6 +1314,212 @@ class BaseAgent:
             output_guardrails=output_guardrails or list(),
         )
         self.preset_prompts = preset_prompts or dict()
+
+        self.embedding_model = embedding_model or os.getenv("OPENAI_EMBEDDING_MODEL")
+        self.default_collection = default_collection
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.retrieval_top_k = retrieval_top_k
+        self.max_context_chars = max_context_chars
+        self.rag_enabled_by_default = rag_enabled_by_default
+        self._rag_prompt_template = rag_prompt_template or (
+            "You are a helpful assistant. Use the following context to answer the question. "
+            "If the context is not sufficient, say you don't know.\n\n"
+            "Context:\n{context}\n\n"
+            "Question:\n{question}"
+        )
+        self._vector_db_path = (
+            vector_db_path or os.getenv("AGENT_VECTOR_DB_PATH") or ".knowledge"
+        )
+        self._chroma = chromadb.PersistentClient(path=self._vector_db_path)
+        self.collections: Dict[str, Agent._MemoryVectorStore] = {}
+        self._hydrate_persistent_collections()
+
+    # ----------------- Built-in Tools -----------------
+
+    @staticmethod
+    def _save_conversation(session_id: str, db_path: str, output_file: str = None):
+        """Helper to export an SQLite session's conversation history to a json file.
+
+        Args:
+            session_id: Session identifier.
+            db_path: Path to the SQLite DB file.
+            output_file: Path to the saved json file. If None, does not save in file, sqlite only.
+
+        Returns:
+            None
+        """
+        session = agents.SQLiteSession(session_id=session_id, db_path=db_path)
+        if output_file:
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(asyncio.run(session.get_items()), f, indent=2)
+
+    # ----------------- Vector database / Embeddings basic tools -----------------
+
+    def _hydrate_persistent_collections(self):
+        try:
+            existing = self._chroma.list_collections()
+            for coll in existing:
+                name = getattr(coll, "name", None)
+                if not name:
+                    continue
+                self.collections[name] = self._ChromaVectorStore(
+                    client=self._chroma,
+                    name=name,
+                    embed_fn=self._embed_texts,
+                )
+            self.logger.info(
+                f"Hydrated {len(self.collections)} collections from '{self._vector_db_path}'."
+            )
+        except Exception as e:
+            self.logger.warning(f"Failed to hydrate Chroma collections: {e}")
+
+    def _embed_texts(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        try:
+            resp = self._oai_sync.embeddings.create(
+                model=self.embedding_model,
+                input=texts,
+            )
+            return [d.embedding for d in resp.data]
+        except Exception as e:
+            self.logger.error(f"Embedding failed: {e}")
+            raise
+
+    def _get_or_create_collection(self, collection_name: str):
+        store = self.collections.get(collection_name)
+        if store:
+            return store
+        store = self._ChromaVectorStore(
+            client=self._chroma,
+            name=collection_name,
+            embed_fn=self._embed_texts,
+        )
+        self.collections[collection_name] = store
+        return store
+
+    def _split_text(self, text: str) -> List[str]:
+        text = text.strip()
+        if not text:
+            return []
+        chunks = []
+        n = len(text)
+        step = max(1, self.chunk_size - self.chunk_overlap)
+        for start in range(0, n, step):
+            end = min(n, start + self.chunk_size)
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            if end >= n:
+                break
+        return chunks
+
+    def _read_file_text(self, path: Path) -> str:
+        suffix = path.suffix.lower()
+        # Pure text
+        text_like = {
+            ".txt",
+            ".md",
+            ".rst",
+            ".py",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".csv",
+            ".tsv",
+            ".xml",
+            ".html",
+            ".htm",
+            ".ini",
+            ".cfg",
+            ".toml",
+            ".log",
+        }
+        if suffix in text_like:
+            try:
+                return path.read_text(encoding="utf-8", errors="ignore")
+            except Exception as e:
+                self.logger.warning(f"Failed to read {path}: {e}")
+                return ""
+
+        if suffix == ".pdf":
+            try:
+                from pypdf import PdfReader
+
+                reader = PdfReader(str(path))
+                pages = [p.extract_text() or "" for p in reader.pages]
+                return "\n".join(pages)
+            except Exception as e:
+                self.logger.warning(f"To read PDF install pypdf. Skip {path}: {e}")
+                return ""
+
+        if suffix == ".docx":
+            try:
+                import docx  # python-docx
+
+                doc = docx.Document(str(path))
+                return "\n".join([p.text for p in doc.paragraphs])
+            except Exception as e:
+                self.logger.warning(
+                    f"To read DOCX install python-docx. Skip {path}: {e}"
+                )
+                return ""
+
+        self.logger.info(f"Skip non-text file: {path}")
+        return ""
+
+    def _build_context_from_hits(self, hits: List[Dict]) -> str:
+        if not hits:
+            return ""
+        parts = []
+        total = 0
+        for h in hits:
+            src = h.get("metadata", {}).get("source", "unknown")
+            snippet = h["text"].strip().replace("\n", " ").strip()
+            piece = f"[source: {src}]\n{snippet}\n"
+            if total + len(piece) > self.max_context_chars:
+                break
+            parts.append(piece)
+            total += len(piece)
+        return "\n".join(parts)
+
+    def _maybe_augment_prompt(
+        self,
+        prompt: str,
+        use_knowledge: Optional[bool],
+        collection_name: Optional[str],
+        top_k: Optional[int],
+    ) -> str:
+        collection_name = collection_name or self.default_collection
+        store = self.collections.get(collection_name)
+
+        if use_knowledge is None:
+            enable_rag = self.rag_enabled_by_default and store and len(store) > 0
+        else:
+            enable_rag = use_knowledge and store and len(store) > 0
+
+        if not enable_rag:
+            return prompt
+
+        try:
+            hits = self.search_knowledge(
+                prompt, k=top_k or self.retrieval_top_k, collection_name=collection_name
+            )
+            if not hits:
+                return prompt
+            context = self._build_context_from_hits(hits)
+            if not context.strip():
+                return prompt
+            aug = self._rag_prompt_template.format(context=context, question=prompt)
+            return aug
+        except Exception as e:
+            self.logger.warning(
+                f"RAG augmentation failed, fallback to original prompt. Err: {e}"
+            )
+            return prompt
+
+    # ----------------- Public interfaces -----------------
 
     def as_tool(self, tool_name: str, tool_description: str):
         """Expose the underlying agent as a Tool descriptor.
@@ -1262,6 +1536,100 @@ class BaseAgent:
         return self.agent.as_tool(
             tool_name=tool_name, tool_description=tool_description
         )
+
+    def load_knowledge(
+        self,
+        path_or_paths: Union[str, Path, List[Union[str, Path]]],
+        collection_name: Optional[str] = None,
+        recursive: bool = True,
+        include_globs: Optional[List[str]] = None,
+        exclude_globs: Optional[List[str]] = None,
+    ) -> Dict[str, int]:
+        collection_name = collection_name or self.default_collection
+        store = self._get_or_create_collection(collection_name)
+
+        if isinstance(path_or_paths, (str, Path)):
+            paths = [path_or_paths]
+        else:
+            paths = list(path_or_paths)
+
+        include_globs = include_globs or [
+            "**/*.md",
+            "**/*.txt",
+            "**/*.py",
+            "**/*.json",
+            "**/*.yaml",
+            "**/*.yml",
+            "**/*.csv",
+            "**/*.tsv",
+            "**/*.html",
+            "**/*.htm",
+            "**/*.log",
+            "**/*.rst",
+        ]
+        exclude_globs = exclude_globs or []
+
+        files: List[Path] = []
+        for p in paths:
+            p = Path(p)
+            if p.is_dir():
+                for pattern in include_globs:
+                    for fp in (
+                        p.glob(pattern)
+                        if recursive
+                        else p.glob(pattern.replace("**/", ""))
+                    ):
+                        files.append(fp)
+            elif p.is_file():
+                files.append(p)
+            else:
+                self.logger.warning(f"Path not found or unsupported: {p}")
+
+        exclude_set = set()
+        for pat in exclude_globs:
+            for f in list(files):
+                if f.match(pat):
+                    exclude_set.add(f)
+        files = [f for f in files if f not in exclude_set]
+
+        files = sorted(set(files))
+        file_count = 0
+        chunk_count = 0
+        for f in files:
+            text = self._read_file_text(f)
+            if not text.strip():
+                continue
+            chunks = self._split_text(text)
+            if not chunks:
+                continue
+            metadatas = [
+                {"source": str(f), "chunk_index": i} for i in range(len(chunks))
+            ]
+            added = store.add_texts(chunks, metadatas)
+            if added > 0:
+                file_count += 1
+                chunk_count += added
+
+        self.logger.info(
+            f"Knowledge loaded into collection '{collection_name}': files={file_count}, chunks={chunk_count}"
+        )
+        return {"files": file_count, "chunks": chunk_count}
+
+    def search_knowledge(
+        self,
+        query: str,
+        k: Optional[int] = None,
+        collection_name: Optional[str] = None,
+    ) -> List[Dict]:
+        collection_name = collection_name or self.default_collection
+        store = self.collections.get(collection_name)
+        if not store or len(store) == 0:
+            self.logger.info(f"No knowledge found in collection '{collection_name}'.")
+            return []
+        k = k or self.retrieval_top_k
+        hits = store.search(query, k=k)
+        results = [{"text": t, "metadata": m, "score": s} for t, m, s in hits]
+        return results
 
     def run(self, prompt: str, session_id: str = None, db_path: str = None):
         """Synchronously run a prompt using the agent within an SQLite-backed session.
@@ -1284,7 +1652,15 @@ class BaseAgent:
             ),
         )
 
-    def run_sync(self, prompt: str, session_id: str = None, db_path: str = None):
+    def run_sync(
+        self,
+        prompt: str,
+        session_id: str = None,
+        db_path: str = None,
+        use_knowledge: Optional[bool] = None,
+        collection_name: Optional[str] = None,
+        top_k: Optional[int] = None,
+    ):
         """Run a prompt synchronously using the agent (blocking).
 
         This wraps agents.Runner.run_sync and uses an SQLiteSession similar to run().
@@ -1297,16 +1673,28 @@ class BaseAgent:
         Returns:
             The result returned by agents.Runner.run_sync (implementation-specific).
         """
+        prompt_to_run = self._maybe_augment_prompt(
+            prompt=prompt,
+            use_knowledge=use_knowledge,
+            collection_name=collection_name,
+            top_k=top_k,
+        )
         return agents.Runner.run_sync(
             self.agent,
-            prompt,
+            prompt_to_run,
             session=agents.SQLiteSession(
                 session_id=session_id or uuid.uuid4().hex, db_path=db_path or ":memory:"
             ),
         )
 
     async def run_streamed(
-        self, prompt: str, session_id: str = None, db_path: str = None
+        self,
+        prompt: str,
+        session_id: str = None,
+        db_path: str = None,
+        use_knowledge: Optional[bool] = None,
+        collection_name: Optional[str] = None,
+        top_k: Optional[int] = None,
     ):
         """Run a prompt and process stream events asynchronously.
 
@@ -1325,19 +1713,27 @@ class BaseAgent:
         session = agents.SQLiteSession(
             session_id=session_id or uuid.uuid4().hex, db_path=db_path or ":memory:"
         )
+
+        prompt_to_run = self._maybe_augment_prompt(
+            prompt=prompt,
+            use_knowledge=use_knowledge,
+            collection_name=collection_name,
+            top_k=top_k,
+        )
+
         result = agents.Runner.run_streamed(
             self.agent,
-            prompt,
+            prompt_to_run,
             session=session,
         )
         async for event in result.stream_events():
-            # We'll ignore the raw responses event deltas
-            if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+            # We'll print streaming delta if available
+            if event.type == "raw_response_event" and isinstance(
+                event.data, ResponseTextDeltaEvent
+            ):
                 print(event.data.delta, end="", flush=True)
-            # When the agent updates, print that
             elif event.type == "agent_updated_stream_event":
                 self.logger.debug(f"Agent updated: {event.new_agent.name}")
-            # When items are generated, print them
             elif event.type == "run_item_stream_event":
                 if event.item.type == "tool_call_item":
                     self.logger.info(
@@ -1352,7 +1748,7 @@ class BaseAgent:
                         f"{'-' * 20} Message output: {'-' * 20}\n {agents.ItemHelpers.text_message_output(event.item)}"
                     )
                 else:
-                    pass  # Ignore other event types
+                    pass
         return result
 
     async def acli(
@@ -1378,6 +1774,7 @@ class BaseAgent:
         db_path = db_path or ":memory:"
 
         while True:
+            use_knowledge = False
             try:
                 user_input = input(" >>> ")
             except (EOFError, KeyboardInterrupt):
@@ -1393,7 +1790,19 @@ class BaseAgent:
                     print(f"Unknown preset prompt: {user_input}")
                     continue
             elif user_input.startswith("#"):
-                pass  # reserved for future knowledge commands
+                use_knowledge = True
+                cmd = user_input[1:].strip()
+                if cmd.startswith("search "):
+                    q = cmd[len("search ") :].strip()
+                    hits = self.search_knowledge(q)
+                    for i, h in enumerate(hits, 1):
+                        print(
+                            f"[{i}] score={h['score']:.4f}, source={h['metadata'].get('source')}"
+                        )
+                        print(h["text"][:500], "...\n")
+                    continue
+                else:
+                    pass
             elif user_input.startswith("!"):
                 user_input = user_input[1:].strip()
                 subprocess.run(user_input, shell=True)
@@ -1403,15 +1812,21 @@ class BaseAgent:
 
             result: agents.RunResult
             if stream:
-                result = self.run_streamed(
-                    prompt=user_input, session_id=session_id, db_path=db_path
+                result = await self.run_streamed(
+                    prompt=user_input,
+                    session_id=session_id,
+                    db_path=db_path,
+                    use_knowledge=use_knowledge,
                 )
             else:
                 result = await self.run(
-                    prompt=user_input, session_id=session_id, db_path=db_path
+                    prompt=user_input,
+                    session_id=session_id,
+                    db_path=db_path,
+                    use_knowledge=use_knowledge,
                 )
-                if result.final_output is not None:
-                    self.logger.info(result.final_output)
+            if result.final_output is not None:
+                self.logger.info(result.final_output)
 
     def cli(self, stream: bool = True, session_id: str = None, db_path: str = None):
         """
