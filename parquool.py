@@ -2048,6 +2048,8 @@ class Agent:
         url_or_urls: Union[str, List],
         engine: Literal["direct", "browser"] = None,
         return_format: Literal["markdown", "html", "text", "screeshot"] = None,
+        with_links_summary: Literal["all", "true"] = "true",
+        with_image_summary: Literal["all", "true"] = "true",
         retain_image: bool = False,
         do_not_track: bool = True,
         set_cookie: str = None,
@@ -2073,6 +2075,16 @@ class Agent:
                 - "screeshot": request an image capture of the page (note the implementation
                 currently expects the literal "screeshot").
                 If omitted, the proxy service default is used.
+            with_links_summary (Literal["all", "true"], optional):
+                Wether to summarize all the links in the end of the result page:
+                - "all": list all the links in the page and summarize them in the end.
+                - "true": list all the unique links in the page and summarize them in the end.
+                - None: keep links in-line in result.
+            with_image_summary (Literal["all", "true"], optional):
+                Wether to summarize all the images in the end of the result page:
+                - "all": list all the images in the page and summarize them in the end.
+                - "true": list all the unique images in the page and summarize them in the end.
+                - None: keep images in-line in result.
             retain_image (bool, optional): If True (default), the returned HTML/Markdown may
                 include image references. If False, images are disabled/removed by the proxy.
             do_not_track (bool, optional): If True (default), the header DNT: 1 is sent to
@@ -2098,6 +2110,10 @@ class Agent:
             headers["X-Engine"] = engine
         if return_format:
             headers["X-Return-Format"] = return_format
+        if with_links_summary:
+            headers["X-With-Links-Summary"] = with_links_summary
+        if with_image_summary:
+            headers["X-With-Images-Summary"] = with_image_summary
         if not retain_image:
             headers["X-Retain-Images"] = "none"
         if do_not_track:
