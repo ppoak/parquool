@@ -36,6 +36,9 @@ knowledge = [
     "pypdf>=6.1.0",
     "python-docx>=1.2.0",
 ]
+websearch = [
+    "serpapi>=0.1.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/ppoak/parquool"

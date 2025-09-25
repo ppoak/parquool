@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import random
 import shutil
 import time
 import traceback
@@ -9,7 +10,7 @@ import uuid
 from copy import deepcopy
 from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union, Callable, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Union, Callable, Tuple, Literal
 
 import logging
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
@@ -25,7 +26,6 @@ import dotenv
 import agents
 import chromadb
 import litellm
-import openai
 import requests
 import markdown
 import duckdb
@@ -481,7 +481,6 @@ class DuckParquet:
           partition_by arguments to optimize performance.
     """
 
-    # ... existing code ...
     def __init__(
         self,
         dataset_path: str,
@@ -971,7 +970,6 @@ class DuckParquet:
         if on_in:
             in_vals = []
             for v in on_in:
-                # 按str或数字
                 if isinstance(v, str):
                     in_vals.append(f"'{v}'")
                 else:
@@ -981,7 +979,7 @@ class DuckParquet:
         # PIVOT USING
         pivot_using = f"{aggfunc}({DuckParquet._quote_ident(values)})"
 
-        # PIVOT 语句
+        # PIVOT
         sql_lines = [f"PIVOT ({sel_sql})", f"ON {pivot_on}", f"USING {pivot_using}"]
 
         # GROUP BY
@@ -1207,7 +1205,6 @@ class Collection:
         _vector_db_path (str): Filesystem path where the Chroma persistent database is stored.
         _chroma (chromadb.PersistentClient): Underlying persistent Chroma client instance.
         collections (Dict[str, _ChromaVectorStore]): In-memory map of collection name to _ChromaVectorStore wrappers.
-        _oai_sync: OpenAI-compatible client used to request embeddings.
         _rerank_fn (Optional[Callable]): Internal callable performing reranking when configured.
         logger: Logger instance used for informational and error messages.
 
@@ -1317,9 +1314,9 @@ class Collection:
 
         Args:
             default_collection (str): Default collection name to use for loading and searching knowledge.
-            base_url (Optional[str]): Base URL for the OpenAI-compatible API. If None, read from OPENAI_BASE_URL env.
-            api_key (Optional[str]): API key for the OpenAI-compatible API. If None, read from OPENAI_API_KEY env.
-            embedding_model (Optional[str]): Embedding model name. If None, read from OPENAI_EMBEDDING_MODEL env.
+            base_url (Optional[str]): Base URL for the OpenAI-compatible API. If None, read from LITELLM_BASE_URL env.
+            api_key (Optional[str]): API key for the OpenAI-compatible API. If None, read from LITELLM_API_KEY env.
+            embedding_model (Optional[str]): Embedding model name. If None, read from LITELLM_EMBEDDING_MODEL env.
             chunk_size (int): Maximum number of characters per text chunk.
             chunk_overlap (int): Overlap size in characters between adjacent chunks.
             retrieval_top_k (int): Number of top vector search results to return by default.
@@ -1331,13 +1328,11 @@ class Collection:
 
         """
         dotenv.load_dotenv()
-        self._oai_sync = openai.OpenAI(
-            base_url=base_url
-            or os.getenv("OPENAI_BASE_URL")
-            or "https://api.openai.com/v1",
-            api_key=api_key or os.getenv("OPENAI_API_KEY"),
+        self.base_url = (
+            base_url or os.getenv("LITELLM_BASE_URL") or "https://api.openai.com/v1"
         )
-        self.embedding_model = embedding_model or os.getenv("OPENAI_EMBEDDING_MODEL")
+        self.api_key = api_key or os.getenv("LITELLM_API_KEY")
+        self.embedding_model = embedding_model or os.getenv("LITELLM_EMBEDDING_MODEL")
         self.default_collection = default_collection
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
@@ -1352,7 +1347,7 @@ class Collection:
         self.collections: Dict[str, Agent._MemoryVectorStore] = {}
         self._hydrate_persistent_collections()
         self._rerank_fn = None
-        self.reranker_model = reranker_model or os.getenv("OPENAI_RERANKER_MODEL")
+        self.reranker_model = reranker_model or os.getenv("LITELLM_RERANKER_MODEL")
         self.rerank_top_k = rerank_top_k or retrieval_top_k
         self._setup_reranker()
 
@@ -1396,11 +1391,13 @@ class Collection:
         if not texts:
             return []
         try:
-            resp = self._oai_sync.embeddings.create(
+            resp = litellm.embedding(
                 model=self.embedding_model,
                 input=texts,
+                base_url=self.base_url,
+                api_key=self.api_key,
             )
-            return [d.embedding for d in resp.data]
+            return [d["embedding"] for d in resp.data]
         except Exception as e:
             self.logger.error(f"Embedding failed: {e}")
             raise
@@ -1541,8 +1538,8 @@ class Collection:
                 documents=docs,
                 top_n=top_n,
                 return_documents=False,
-                base_url=os.getenv("OPENAI_BASE_URL"),
-                api_key=os.getenv("OPENAI_API_KEY"),
+                base_url=self.base_url,
+                api_key=self.api_key,
             )
 
             items = None
@@ -1621,7 +1618,7 @@ class Collection:
             ranked.sort(key=lambda x: x[1], reverse=True)
         return ranked
 
-    def load_knowledge(
+    def load(
         self,
         path_or_paths: Union[str, Path, List[Union[str, Path]]],
         collection_name: Optional[str] = None,
@@ -1715,7 +1712,7 @@ class Collection:
         )
         return {"files": file_count, "chunks": chunk_count}
 
-    def search_knowledge(
+    def search(
         self,
         query: str,
         collection_name: Optional[str] = None,
@@ -1855,12 +1852,12 @@ class Agent:
         - Creates the internal agents.Agent instance with provided settings.
 
         Args:
-            base_url (str, optional): Base URL for the OpenAI client. Defaults to environment variable OPENAI_BASE_URL if not set.
-            api_key (str, optional): API key for the OpenAI client. Defaults to environment variable OPENAI_API_KEY if not set.
+            base_url (str, optional): Base URL for the OpenAI client. Defaults to environment variable LITELLM_BASE_URL if not set.
+            api_key (str, optional): API key for the OpenAI client. Defaults to environment variable LITELLM_API_KEY if not set.
             name (str): Name of the agent wrapper and underlying agent.
             log_file (str, optional): Path to file for logging output.
             log_level (str): Logging verbosity level (e.g. "INFO", "DEBUG").
-            model_name (str, optional): Name of the model to use. Defaults to environment variable OPENAI_MODEL_NAME if not set.
+            model_name (str, optional): Name of the model to use. Defaults to environment variable LITELLM_MODEL_NAME if not set.
             model_settings (dict, optional): Additional model configuration forwarded to agents.ModelSettings.
             instructions (str): High-level instructions for the underlying agent.
             preset_prompts (dict, optional): Dictionary of preset prompts for common tasks.
@@ -1912,9 +1909,9 @@ class Agent:
                 self.logger.warning("tools must be agents.Tool or callable instances")
 
         self.model = LitellmModel(
-            model=model_name or os.getenv("OPENAI_MODEL_NAME"),
-            base_url=base_url or os.getenv("OPENAI_BASE_URL"),
-            api_key=api_key or os.getenv("OPENAI_API_KEY"),
+            model=model_name or os.getenv("LITELLM_MODEL_NAME"),
+            base_url=base_url or os.getenv("LITELLM_BASE_URL"),
+            api_key=api_key or os.getenv("LITELLM_API_KEY"),
         )
 
         model_settings = model_settings or dict()
@@ -1929,7 +1926,7 @@ class Agent:
             )
 
         self.collection = collection
-        if not isinstance(self.collection, Collection):
+        if not isinstance(self.collection, Collection) and not self.collection is None:
             self.collection = None
             self.logger.warning("collections must be Collection instances")
         self.rag_max_context = rag_max_context
@@ -1961,6 +1958,173 @@ class Agent:
         )
 
     # ----------------- Built-in Tools -----------------
+
+    @staticmethod
+    def google_search(
+        query: str,
+        location: Literal["China", "United States", "Germany", "France"] = None,
+        country: str = None,
+        language: str = None,
+        to_be_searched: str = None,
+        start: str = None,
+        num: str = None,
+    ):
+        """
+        Google search page result tool. When asked about a question, you can use this tool to get an original google search page result.
+        After browsing the search page result, you can pick some of the valuable result links to view by the `read_url` tool.
+
+        Args:
+            query (str): Parameter defines the query you want to search.
+                You can use anything that you would use in a regular Google search. e.g. inurl:, site:, intitle:.
+                We also support advanced search query parameters such as as_dt and as_eq.
+            location (str): Parameter defines from where you want the search to originate.
+                If several locations match the location requested, we'll pick the most popular one.
+                If location is omitted, the search may take on the location of the proxy.
+                When only the location parameter is set, Google may still take into account the proxy’s country, which can influence some results.
+                For more consistent country-specific filtering, use the `country` parameter alongside location.
+            country (str): Parameter defines the country to use for the Google search.
+                It's a two-letter country code. (e.g., cn for China, us for the United States, uk for United Kingdom, or fr for France).
+                Your country code should be supported by Google countries codes.
+            language (str): Parameter defines the language to use for the Google search.
+                It's a two-letter language code. (e.g., zh-cn for Chinese(Simplified), en for English, es for Spanish, or fr for French).
+                Your language code should be supported by Google languages.
+            to_be_searched (str): parameter defines advanced search parameters that aren't possible in the regular query field.
+                (e.g., advanced search for patents, dates, news, videos, images, apps, or text contents).
+            start (str): Parameter defines the result offset. It skips the given number of results.
+                It's used for pagination. (e.g., 0 (default) is the first page of results, 10 is the 2nd page of results, 20 is the 3rd page of results, etc.).
+                Google Local Results only accepts multiples of 20 (e.g. 20 for the second page results, 40 for the third page results, etc.) as the start value.
+            num (str): Parameter defines the maximum number of results to return.
+                (e.g., 10 (default) returns 10 results, 40 returns 40 results, and 100 returns 100 results).
+                The use of num may introduce latency, and/or prevent the inclusion of specialized result types.
+                It is better to omit this parameter unless it is strictly necessary to increase the number of results per page.
+                Results are not guaranteed to have the number of results specified in num.
+
+        Return:
+            (str) The search report in markdown format.
+        """
+
+        try:
+            import serpapi
+        except ImportError as e:
+            return 'No web search backend found, install by `pip install "parquool[websearch]"`'
+
+        api_keys = [key.strip() for key in os.getenv("SERPAPI_KEY").split(",")]
+        random.shuffle(api_keys)
+        param_names = ["location", "gl", "hl", "tbs", "start", "num"]
+        param_vars = [location, country, language, to_be_searched, start, num]
+        params = {"engine": "google", "q": query}
+        for name, param in zip(param_names, param_vars):
+            if param is not None:
+                params[name] = param
+
+        for api_key in api_keys:
+            try:
+                result = serpapi.search(params, api_key=api_key)
+            except Exception as e:
+                continue
+            result = result.as_dict()
+            break
+
+        else:
+            return f"All {len(api_keys)} tried, none success, check the environment variable SERPAPI_KEY for your api key"
+
+        search_metadata = result["search_metadata"]
+        search_report = (
+            f"# Search Report for Query {query}\n\n"
+            f"Created at {search_metadata['created_at']}, processed at {search_metadata['processed_at']}."
+            f"You can get access to json file at {search_metadata['json_endpoint']}, html file at {search_metadata['raw_html_file']}."
+            f"{result['search_information']['total_results']} Found. {search_metadata['total_time_taken']} seconds taken.\n\n"
+        )
+        for ores in result.get("organic_results", []):
+            search_report += (
+                f"## [{ores['title']}]({ores['link']})\n\n"
+                + f"[{ores['source']}] {ores['snippet']}\n\n"
+                + (f"> date: {ores['date']}\n" if "date" in ores.keys() else "")
+            )
+        return search_report
+
+    @staticmethod
+    def read_url(
+        url_or_urls: Union[str, List],
+        engine: Literal["direct", "browser"] = None,
+        return_format: Literal["markdown", "html", "text", "screeshot"] = None,
+        retain_image: bool = False,
+        do_not_track: bool = True,
+        set_cookie: str = None,
+        max_length_each: int = 100000,
+    ):
+        """Fetch and summarize the readable content of one or more URLs via the r.jina.ai reader proxy.
+
+        The agent should call this tool when it needs the actual page text or a snapshot of the page to
+        extract facts, quotes, or to decide whether the page is worth further processing.
+
+        Args:
+            url_or_urls (Union[str, List]): A single URL string or a list of URL strings to read.
+                Provide full URLs as produced by search results (e.g., "https://example.com/page").
+            engine (Literal["direct", "browser"], optional): Which fetching engine the proxy
+                should use. "direct" performs a direct HTTP fetch, "browser" uses a headless
+                browser to render the page (recommended for JS-heavy sites). If omitted, the
+                proxy service default is used.
+            return_format (Literal["markdown", "html", "text", "screeshot"], optional):
+                Desired format of the proxy's returned content:
+                - "markdown": proxy attempts to extract and return a clean Markdown version.
+                - "html": returns raw or minimally processed HTML.
+                - "text": plain text extraction.
+                - "screeshot": request an image capture of the page (note the implementation
+                currently expects the literal "screeshot").
+                If omitted, the proxy service default is used.
+            retain_image (bool, optional): If True (default), the returned HTML/Markdown may
+                include image references. If False, images are disabled/removed by the proxy.
+            do_not_track (bool, optional): If True (default), the header DNT: 1 is sent to
+                indicate "do not track" preference to the proxy.
+            set_cookie (str, optional): If provided, sets a Cookie header value to be passed
+                to the proxy (useful for accessing pages that require a specific cookie).
+            max_length_each (int, optional): Maximum number of characters to include from each
+                successful response in the returned report. Defaults to 7168. Longer pages will
+                be truncated to this length.
+
+        Returns:
+            str: A Markdown-formatted report string describing the results for each requested URL.
+            The report contains:
+            - A summary header with the number of input URLs.
+            - "Success Requests" section listing each successful URL and the first
+                max_length_each characters of the returned content.
+            - "Failure Requests" section listing each URL that failed and the associated
+                error message.
+        """
+        urls = url_or_urls if isinstance(url_or_urls, list) else [url_or_urls]
+        headers = {}
+        if engine:
+            headers["X-Engine"] = engine
+        if return_format:
+            headers["X-Return-Format"] = return_format
+        if not retain_image:
+            headers["X-Retain-Images"] = "none"
+        if do_not_track:
+            headers["DNT"] = "1"
+        if set_cookie:
+            headers["X-Set-Cookie"] = set_cookie
+        failure = []
+        success = []
+
+        for url in urls:
+            try:
+                response = requests.get(f"https://r.jina.ai/{url}", headers=headers)
+                response.raise_for_status()
+                success.append((url, response.text[:max_length_each]))
+            except Exception as e:
+                failure.append((url, str(e)))
+
+        read_report = f"# Read results for {len(urls)}\n\n"
+        read_report += "## Success Resquests\n\n"
+        for suc in success:
+            read_report += f"### {suc[0]}\n\n{suc[1]}"
+
+        read_report += "## Failure Resquests\n\n"
+        for fai in failure:
+            read_report += f"### {fai[0]}\n\n{fai[1]}"
+
+        return read_report
 
     # ----------------- Internal helpers -----------------
 
@@ -2024,9 +2188,7 @@ class Agent:
         collection_name = collection_name or self.collection.default_collection
 
         try:
-            hits = self.collection.search_knowledge(
-                prompt, collection_name=collection_name
-            )
+            hits = self.collection.search(prompt, collection_name=collection_name)
             if not hits:
                 return prompt
             context = self._build_context_from_hits(hits)
