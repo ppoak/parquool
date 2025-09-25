@@ -21,12 +21,20 @@ dependencies = [
     "dotenv>=0.8",
     "duckdb>=1.0",
     "joblib>=1.5",
+    "litellm>=1.77.0",
     "markdown>=3.0",
     "numpy>=2.0",
-    "openai-agents>=0.2",
+    "openai-agents[litellm]>=0.2",
     "pandas>=2.0",
     "requests>=2.32",
     "retry>=0.9",
+]
+
+[project.optional-dependencies]
+knowledge = [
+    "chromadb>=1.1.0",
+    "pypdf>=6.1.0",
+    "python-docx>=1.2.0",
 ]
 
 [project.urls]

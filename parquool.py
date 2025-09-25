@@ -3,14 +3,13 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import time
 import traceback
 import uuid
 from copy import deepcopy
 from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Union, Callable, Tuple
 
 import logging
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
@@ -25,15 +24,15 @@ from email.mime.text import MIMEText
 import dotenv
 import agents
 import chromadb
+import litellm
 import openai
 import requests
 import markdown
 import duckdb
-import numpy as np
 import pandas as pd
 from retry import retry
-from chromadb.utils.embedding_functions import EmbeddingFunction
-from openai.types.responses import ResponseTextDeltaEvent
+from openai.types.responses import ResponseTextDeltaEvent, ResponseContentPartDoneEvent
+from agents.extensions.models.litellm_model import LitellmModel
 
 
 def setup_logger(
@@ -435,7 +434,54 @@ def proxy_request(
 
 
 class DuckParquet:
+    """Manage a directory of Parquet files through a DuckDB-backed view.
 
+    This class exposes a convenient API for querying and mutating a parquet
+    dataset stored in a directory. Internally it creates a DuckDB connection
+    (in-memory by default or a file DB if db_path is provided) and registers a
+    CREATE OR REPLACE VIEW over parquet_scan(...) (with Hive-style partitioning
+    enabled). Query helpers (select, raw_query, dpivot, ppivot, count, etc.)
+    operate against that view. Mutation helpers (upsert_from_df, update,
+    delete) rewrite Parquet files atomically into a temporary directory and then
+    replace the dataset directory to ensure safe, consistent updates. Partitioning
+    behavior is supported for writes via the partition_by parameter.
+
+    Typical usage:
+        >>> dp = DuckParquet("/path/to/parquet_dir")
+        >>> df = dp.select("*", where="ds = '2025-01-01'")
+        >>> dp.upsert_from_df(new_rows_df, keys=["id"], partition_by=["ds"])
+        >>> dp.refresh()  # refresh the internal DuckDB view after external changes
+        >>> dp.close()
+
+    Important behavior:
+        - A DuckDB view named view_name is created automatically to read the
+          parquet files using parquet_scan('{scan_pattern}', HIVE_PARTITIONING=1).
+        - Mutations are implemented by creating parquet files in a local
+          temporary directory and then atomically replacing the dataset
+          directory contents. This ensures updates are all-or-nothing.
+        - Partitioned writes will create subdirectories for each partition value.
+        - The class attempts to set DuckDB threads according to the threads
+          parameter but will silently continue if the setting cannot be applied.
+        - Identifiers are quoted as needed to be safe SQL identifiers.
+
+    Attributes:
+        dataset_path (str): Absolute path of the Parquet dataset directory.
+        view_name (str): The name of the DuckDB view exposing the dataset.
+        con (duckdb.DuckDBPyConnection): Active DuckDB connection object.
+        threads (int): Number of threads configured for DuckDB operations.
+        scan_pattern (str): Glob pattern passed to parquet_scan to read files.
+
+    Raises:
+        ValueError: If dataset_path exists but is not a directory.
+
+    Notes:
+        - The class supports use as a context manager: use "with DuckParquet(...)"
+          to ensure the DuckDB connection is closed on exit.
+        - For large datasets or heavy write workloads, tune the threads and
+          partition_by arguments to optimize performance.
+    """
+
+    # ... existing code ...
     def __init__(
         self,
         dataset_path: str,
@@ -1143,31 +1189,75 @@ class DuckParquet:
         self.refresh()
 
 
-class Agent:
-    """High-level wrapper around the internal `agents.Agent` providing conveniences
-    for initialization, running, streaming, and CLI integration.
+class Collection:
+    """Manage an LLM agent knowledge store backed by a persistent Chroma vector database and OpenAI-compatible embeddings.
 
-    This class sets up the OpenAI client and tracing defaults, configures logging,
-    and exposes synchronous, asynchronous, and streamed run methods that use an
-    SQLite-backed session by default.
+    This class provides convenience methods to ingest text files, split them into chunks, compute embeddings,
+    store and retrieve vectors from a persistent Chroma instance, and optionally apply an LLM-based reranker.
+    It centralizes configuration for embedding and reranking models, vector DB path, chunking behavior, and logging.
 
     Attributes:
-        logger: Logger instance used by the wrapper.
-        agent: Underlying agents.Agent instance that executes prompts and tools.
+        default_collection (str): Default collection name used when none is provided to load/search methods.
+        embedding_model (Optional[str]): Name of the embedding model used to compute embeddings.
+        chunk_size (int): Maximum number of characters per chunk when splitting documents.
+        chunk_overlap (int): Number of characters overlapping between adjacent chunks.
+        retrieval_top_k (int): Default number of top vector search results to return.
+        reranker_model (Optional[str]): Optional model name for LLM-based reranking. When None, reranking is disabled.
+        rerank_top_k (int): Number of documents to keep after reranking (or used as reranker top_n).
+        _vector_db_path (str): Filesystem path where the Chroma persistent database is stored.
+        _chroma (chromadb.PersistentClient): Underlying persistent Chroma client instance.
+        collections (Dict[str, _ChromaVectorStore]): In-memory map of collection name to _ChromaVectorStore wrappers.
+        _oai_sync: OpenAI-compatible client used to request embeddings.
+        _rerank_fn (Optional[Callable]): Internal callable performing reranking when configured.
+        logger: Logger instance used for informational and error messages.
+
+    Example:
+        >>> col = Collection(default_collection="notes", embedding_model="text-embedding-3-small", vector_db_path=".kb")
+        >>> col.load_knowledge("/path/to/docs")
+        >>> results = col.search_knowledge("How to configure the system?")
     """
 
     class _ChromaVectorStore:
-        def __init__(self, client, name, embed_fn):
+
+        def __init__(
+            self, client: chromadb.PersistentClient, name: str, embed_fn: Callable
+        ):
+            """Initialize an internal Chroma-backed vector store wrapper.
+
+            Args:
+                client (chromadb.PersistentClient): Chroma persistent client instance used to create/get collections.
+                name (str): Name of the Chroma collection to manage.
+                embed_fn (Callable): Callable that takes a list of strings and returns list of embeddings.
+            """
             self.collection = client.get_or_create_collection(name=name)
             self.embed_fn = embed_fn
 
         def __len__(self):
+            """Return the number of items stored in the underlying Chroma collection.
+
+            Returns:
+                int: Number of documents in the collection. Returns 0 if the count cannot be retrieved.
+            """
             try:
                 return self.collection.count()
             except Exception:
                 return 0
 
         def add_texts(self, texts, metadatas=None):
+            """Add a list of text documents with optional metadata into the collection.
+
+            The function will generate stable ids for documents based on metadata 'source'
+            and 'chunk_index' if provided, compute embeddings via the embed_fn, and upsert
+            documents into the Chroma collection.
+
+            Args:
+                texts (Iterable[str]): Iterable of text chunks to insert.
+                metadatas (Optional[Iterable[dict]]): Iterable of metadata dicts corresponding to each text.
+                    If not provided, empty metadata dicts will be used.
+
+            Returns:
+                int: Number of texts added.
+            """
             if metadatas is None:
                 metadatas = [{} for _ in texts]
             ids = []
@@ -1182,6 +1272,18 @@ class Agent:
             return len(texts)
 
         def search(self, query, k=5):
+            """Search the collection for documents most similar to the query.
+
+            Embeds the query with embed_fn, performs a Chroma nearest-neighbor query and
+            converts Chroma distances into heuristic similarity scores (1.0 - distance).
+
+            Args:
+                query (str): Query string to search for.
+                k (int): Number of top results to return.
+
+            Returns:
+                List[Tuple[str, dict, float]]: A list of tuples (document_text, metadata, score).
+            """
             q_emb = self.embed_fn([query])[0]
             res = self.collection.query(query_embeddings=[q_emb], n_results=k)
             docs = res.get("documents", [[]])[0]
@@ -1195,168 +1297,73 @@ class Agent:
 
     def __init__(
         self,
+        default_collection: str = "default",
         base_url: str = None,
         api_key: str = None,
-        name: str = "pqagent",
-        log_file: str = None,
-        log_level: str = "INFO",
-        model_name: str = None,
-        model_settings: dict = None,
-        instructions: str = "You are a helpful assistant.",
-        preset_prompts: dict = None,
-        tools: List[agents.FunctionTool] = None,
-        tool_use_behavior: str = "run_llm_again",
-        handoffs: List[agents.Agent] = None,
-        output_type: str = None,
-        input_guardrails: List[agents.InputGuardrail] = None,
-        output_guardrails: List[agents.OutputGuardrail] = None,
-        default_openai_api: str = "chat_completions",
-        use_model_training: bool = False,
-        trace_disabled: bool = True,
         embedding_model: str = None,
-        default_collection: str = "default",
         chunk_size: int = 1000,
         chunk_overlap: int = 200,
         retrieval_top_k: int = 5,
-        max_context_chars: int = 6000,
-        rag_enabled_by_default: bool = True,
-        rag_prompt_template: str = None,
         vector_db_path: str = None,
+        reranker_model: Optional[str] = None,
+        rerank_top_k: Optional[int] = None,
+        log_level: str = "INFO",
+        log_file: Union[str, Path] = None,
     ):
-        """Create and configure an Agent wrapper.
+        """Initialize a Collection used as an LLM agent knowledge store backed by Chroma and OpenAI embeddings.
 
-        This initializer:
-        - Loads environment variables.
-        - Configures the default OpenAI client and API mode.
-        - Enables/disables tracing.
-        - Sets up logging.
-        - Constructs the underlying agents.Agent with the provided settings.
+        This constructor sets up the OpenAI client, embedding model, persistent Chroma client,
+        local collections map, optional LLM reranker, and logging.
 
         Args:
-            base_url: Optional base URL for the OpenAI client. Falls back to OPENAI_BASE_URL env var.
-            api_key: Optional API key for the OpenAI client. Falls back to OPENAI_API_KEY env var.
-            name: Name for this agent wrapper and the underlying agent.
-            log_file: File path to write logs to.
-            log_level: Logging level (e.g. "INFO", "DEBUG").
-            model_name: Name of the model to use. Falls back to OPENAI_MODEL_NAME env var.
-            model_settings: Additional model configuration forwarded to agents.ModelSettings.
-            instructions: High-level instructions passed to the underlying agent.
-            preset_prompts: Optional dict of preset prompts for common tasks.
-            tools: Optional list of tools available to the agent.
-            tool_use_behavior: Strategy for how tools are used by the agent.
-            handoffs: Optional list of handoff agents.
-            output_type: Optional output type annotation for the underlying agent.
-            input_guardrails: Optional list of input guardrails.
-            output_guardrails: Optional list of output guardrails.
-            default_openai_api: Default OpenAI API mode to use (e.g. "chat_completions").
-            use_model_training: If True, the OpenAI client is used for tracing/model training.
-            trace_disabled: If True, tracing is disabled.
+            default_collection (str): Default collection name to use for loading and searching knowledge.
+            base_url (Optional[str]): Base URL for the OpenAI-compatible API. If None, read from OPENAI_BASE_URL env.
+            api_key (Optional[str]): API key for the OpenAI-compatible API. If None, read from OPENAI_API_KEY env.
+            embedding_model (Optional[str]): Embedding model name. If None, read from OPENAI_EMBEDDING_MODEL env.
+            chunk_size (int): Maximum number of characters per text chunk.
+            chunk_overlap (int): Overlap size in characters between adjacent chunks.
+            retrieval_top_k (int): Number of top vector search results to return by default.
+            vector_db_path (Optional[str]): Filesystem path to persist Chroma DB. If None, read from AGENT_VECTOR_DB_PATH env or default '.knowledge'.
+            reranker_model (Optional[str]): Optional reranker model name used for LLM-based re-ranking.
+            rerank_top_k (Optional[int]): Number of documents to keep after reranking. If None, uses retrieval_top_k.
+            log_level (str): Logging level name.
+            log_file (Optional[Union[str, Path]]): Optional path to a log file.
 
-        Returns:
-            None
         """
-
         dotenv.load_dotenv()
         self._oai_sync = openai.OpenAI(
-            base_url=base_url or os.getenv("OPENAI_BASE_URL"),
+            base_url=base_url
+            or os.getenv("OPENAI_BASE_URL")
+            or "https://api.openai.com/v1",
             api_key=api_key or os.getenv("OPENAI_API_KEY"),
         )
-        self._oai_async = openai.AsyncOpenAI(
-            base_url=base_url or os.getenv("OPENAI_BASE_URL"),
-            api_key=api_key or os.getenv("OPENAI_API_KEY"),
-        )
-        agents.set_default_openai_client(
-            client=self._oai_async,
-            use_for_tracing=use_model_training,
-        )
-        agents.set_default_openai_api(api=default_openai_api)
-        agents.set_tracing_disabled(disabled=trace_disabled)
-        self.logger = setup_logger(name, file=log_file, level=log_level)
-
-        handoff_agents = []
-        for handoff in handoffs or []:
-            if isinstance(handoff, Agent):
-                handoff_agents.append(handoff.agent)
-            elif isinstance(handoff, agents.Agent):
-                handoff_agents.append(handoff)
-            else:
-                raise TypeError("handoffs must be BaseAgent or agents.Agent instances")
-
-        function_tools = []
-        self.tools = {"save_conversation": self._save_conversation}
-        for fnt in tools or []:
-            if isinstance(fnt, agents.Tool):
-                function_tools.append(fnt)
-            elif callable(fnt):
-                self.tools[fnt.__name__] = fnt
-                function_tools.append(agents.function_tool(fnt))
-            else:
-                raise TypeError("tools must be agents.Tool or callable instances")
-
-        model_settings = model_settings or dict()
-        if isinstance(model_settings, dict):
-            model_settings = agents.ModelSettings(**model_settings)
-        elif not isinstance(model_settings, agents.ModelSettings):
-            raise TypeError(
-                "model_settings must be a dict or agents.ModelSettings instance"
-            )
-
-        self.agent = agents.Agent(
-            name=name,
-            instructions=instructions,
-            output_type=output_type,
-            tools=function_tools,
-            tool_use_behavior=tool_use_behavior,
-            handoffs=handoff_agents,
-            model=model_name or os.getenv("OPENAI_MODEL_NAME"),
-            model_settings=model_settings,
-            input_guardrails=input_guardrails or list(),
-            output_guardrails=output_guardrails or list(),
-        )
-        self.preset_prompts = preset_prompts or dict()
-
         self.embedding_model = embedding_model or os.getenv("OPENAI_EMBEDDING_MODEL")
         self.default_collection = default_collection
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.retrieval_top_k = retrieval_top_k
-        self.max_context_chars = max_context_chars
-        self.rag_enabled_by_default = rag_enabled_by_default
-        self._rag_prompt_template = rag_prompt_template or (
-            "You are a helpful assistant. Use the following context to answer the question. "
-            "If the context is not sufficient, say you don't know.\n\n"
-            "Context:\n{context}\n\n"
-            "Question:\n{question}"
-        )
         self._vector_db_path = (
             vector_db_path or os.getenv("AGENT_VECTOR_DB_PATH") or ".knowledge"
+        )
+        self.logger = setup_logger(
+            f"Collection({self._vector_db_path})", file=log_file, level=log_level
         )
         self._chroma = chromadb.PersistentClient(path=self._vector_db_path)
         self.collections: Dict[str, Agent._MemoryVectorStore] = {}
         self._hydrate_persistent_collections()
-
-    # ----------------- Built-in Tools -----------------
-
-    @staticmethod
-    def _save_conversation(session_id: str, db_path: str, output_file: str = None):
-        """Helper to export an SQLite session's conversation history to a json file.
-
-        Args:
-            session_id: Session identifier.
-            db_path: Path to the SQLite DB file.
-            output_file: Path to the saved json file. If None, does not save in file, sqlite only.
-
-        Returns:
-            None
-        """
-        session = agents.SQLiteSession(session_id=session_id, db_path=db_path)
-        if output_file:
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(asyncio.run(session.get_items()), f, indent=2)
+        self._rerank_fn = None
+        self.reranker_model = reranker_model or os.getenv("OPENAI_RERANKER_MODEL")
+        self.rerank_top_k = rerank_top_k or retrieval_top_k
+        self._setup_reranker()
 
     # ----------------- Vector database / Embeddings basic tools -----------------
 
     def _hydrate_persistent_collections(self):
+        """Load existing Chroma collections from the persistent path into the in-memory collections map.
+
+        The method queries the Chroma client for collections and wraps each into _ChromaVectorStore
+        using the configured embedding function. Failures are logged and swallowed.
+        """
         try:
             existing = self._chroma.list_collections()
             for coll in existing:
@@ -1375,6 +1382,17 @@ class Agent:
             self.logger.warning(f"Failed to hydrate Chroma collections: {e}")
 
     def _embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """Compute embeddings for a list of texts using the configured OpenAI-compatible embedding client.
+
+        Args:
+            texts (List[str]): List of input strings to embed.
+
+        Returns:
+            List[List[float]]: List of embedding vectors corresponding to each input.
+
+        Raises:
+            Exception: Re-raises any underlying embedding error after logging.
+        """
         if not texts:
             return []
         try:
@@ -1388,6 +1406,14 @@ class Agent:
             raise
 
     def _get_or_create_collection(self, collection_name: str):
+        """Get an existing in-memory collection wrapper or create a new one backed by Chroma.
+
+        Args:
+            collection_name (str): Name of the collection to fetch or create.
+
+        Returns:
+            _ChromaVectorStore: Wrapper instance for the requested collection.
+        """
         store = self.collections.get(collection_name)
         if store:
             return store
@@ -1400,6 +1426,17 @@ class Agent:
         return store
 
     def _split_text(self, text: str) -> List[str]:
+        """Split a long text into chunks according to configured chunk_size and chunk_overlap.
+
+        Chunks are created by sliding a fixed-size window with configured overlap. Empty or whitespace-only
+        chunks are ignored.
+
+        Args:
+            text (str): Input text to split.
+
+        Returns:
+            List[str]: List of non-empty text chunks.
+        """
         text = text.strip()
         if not text:
             return []
@@ -1416,6 +1453,17 @@ class Agent:
         return chunks
 
     def _read_file_text(self, path: Path) -> str:
+        """Read textual content from a file path for supported file types.
+
+        Supported plain-text-like suffixes are read directly. For PDF and DOCX, optional libraries
+        (pypdf and python-docx) are used where available. Unsupported binary files are skipped.
+
+        Args:
+            path (Path): Filesystem path to read.
+
+        Returns:
+            str: Extracted text. Empty string if reading fails or file type is unsupported.
+        """
         suffix = path.suffix.lower()
         # Pure text
         text_like = {
@@ -1469,73 +1517,109 @@ class Agent:
         self.logger.info(f"Skip non-text file: {path}")
         return ""
 
-    def _build_context_from_hits(self, hits: List[Dict]) -> str:
-        if not hits:
-            return ""
-        parts = []
-        total = 0
-        for h in hits:
-            src = h.get("metadata", {}).get("source", "unknown")
-            snippet = h["text"].strip().replace("\n", " ").strip()
-            piece = f"[source: {src}]\n{snippet}\n"
-            if total + len(piece) > self.max_context_chars:
-                break
-            parts.append(piece)
-            total += len(piece)
-        return "\n".join(parts)
+    def _setup_reranker(self):
+        """Configure an optional LLM-based reranking function if a reranker model is provided.
 
-    def _maybe_augment_prompt(
-        self,
-        prompt: str,
-        use_knowledge: Optional[bool],
-        collection_name: Optional[str],
-        top_k: Optional[int],
-    ) -> str:
-        collection_name = collection_name or self.default_collection
-        store = self.collections.get(collection_name)
+        The configured rerank function will call litellm.rerank with the configured model and
+        normalize the returned results into a list of {"index": int, "score": float} items.
+        If no reranker_model is set, the method is a no-op.
+        """
+        if not self.reranker_model:
+            self.logger.debug("No reranker model configured; skip reranking.")
+            return
 
-        if use_knowledge is None:
-            enable_rag = self.rag_enabled_by_default and store and len(store) > 0
-        else:
-            enable_rag = use_knowledge and store and len(store) > 0
+        def _llm_rerank(
+            query: str, docs: List[str], metas: List[Dict], top_n: Optional[int] = None
+        ):
+            if not docs:
+                return []
+            top_n = min(top_n or len(docs), len(docs))
 
-        if not enable_rag:
-            return prompt
-
-        try:
-            hits = self.search_knowledge(
-                prompt, k=top_k or self.retrieval_top_k, collection_name=collection_name
+            data = litellm.rerank(
+                model=self.reranker_model,
+                query=query,
+                documents=docs,
+                top_n=top_n,
+                return_documents=False,
+                base_url=os.getenv("OPENAI_BASE_URL"),
+                api_key=os.getenv("OPENAI_API_KEY"),
             )
-            if not hits:
-                return prompt
-            context = self._build_context_from_hits(hits)
-            if not context.strip():
-                return prompt
-            aug = self._rag_prompt_template.format(context=context, question=prompt)
-            return aug
-        except Exception as e:
-            self.logger.warning(
-                f"RAG augmentation failed, fallback to original prompt. Err: {e}"
-            )
-            return prompt
 
-    # ----------------- Public interfaces -----------------
+            items = None
+            if isinstance(data, dict):
+                items = data.get("results")
+            if not isinstance(items, list):
+                items = data if isinstance(data, list) else []
 
-    def as_tool(self, tool_name: str, tool_description: str):
-        """Expose the underlying agent as a Tool descriptor.
+            out = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                idx = it.get("index")
+                if idx is None:
+                    continue
+                score = it.get("relevance_score")
+                try:
+                    idx = int(idx)
+                except Exception:
+                    continue
+                try:
+                    score = float(score) if score is not None else None
+                except Exception:
+                    score = None
+                if 0 <= idx < len(docs):
+                    out.append({"index": idx, "score": score})
 
-        This is a thin wrapper around agents.Agent.as_tool.
+            if out and all(o.get("score") is not None for o in out):
+                out.sort(key=lambda x: x["score"], reverse=True)
+            return out[:top_n]
+
+        self._rerank_fn = _llm_rerank
+        self.logger.info(f"LLM reranker enabled (model={self.reranker_model}).")
+
+    def _normalize_rerank_result(
+        self, res: List, n_docs: int
+    ) -> List[Tuple[int, Optional[float]]]:
+        """Normalize various reranker result formats into a list of (index, score) tuples.
+
+        Accepts integer indices, (index, score) tuples/lists, or dicts with 'index' and optional 'score'.
+        Filters out invalid indices and sorts by score descending if all items have scores.
 
         Args:
-            tool_name: Name to expose for the tool.
-            tool_description: Description of the tool's behavior.
+            res (List): Raw reranker output in one of several accepted formats.
+            n_docs (int): Number of documents that were reranked (used to validate indices).
 
         Returns:
-            A Tool-like descriptor produced by the underlying agent.
+            List[Tuple[int, Optional[float]]]: Normalized and optionally sorted list of (index, score).
         """
-        return self.agent.as_tool(
-            tool_name=tool_name, tool_description=tool_description
-        )
+        ranked: List[Tuple[int, Optional[float]]] = []
+        if not isinstance(res, list) or not res:
+            return ranked
+        for item in res:
+            idx = None
+            score = None
+            if isinstance(item, int):
+                idx = item
+            elif isinstance(item, (tuple, list)) and len(item) >= 1:
+                idx = int(item[0])
+                if len(item) > 1:
+                    try:
+                        score = float(item[1])
+                    except Exception:
+                        score = None
+            elif isinstance(item, dict):
+                if "index" in item:
+                    idx = int(item["index"])
+                if item.get("score") is not None:
+                    try:
+                        score = float(item["score"])
+                    except Exception:
+                        score = None
+            if idx is not None and 0 <= idx < n_docs:
+                ranked.append((idx, score))
+        if ranked and all(s is not None for _, s in ranked):
+            ranked.sort(key=lambda x: x[1], reverse=True)
+        return ranked
 
     def load_knowledge(
         self,
@@ -1545,6 +1629,22 @@ class Agent:
         include_globs: Optional[List[str]] = None,
         exclude_globs: Optional[List[str]] = None,
     ) -> Dict[str, int]:
+        """Load files from one or more paths into the specified collection as vectorized knowledge chunks.
+
+        The method discovers files according to include/exclude glob patterns, reads text from supported files,
+        splits texts into chunks, computes embeddings and upserts them to the target collection. It returns
+        counts of files and chunks added.
+
+        Args:
+            path_or_paths (Union[str, Path, List[Union[str, Path]]]): Single path or list of paths (files or directories).
+            collection_name (Optional[str]): Target collection name. Defaults to the instance default_collection.
+            recursive (bool): Whether to search directories recursively when applying include_globs.
+            include_globs (Optional[List[str]]): List of glob patterns to include. If None, a sensible default list is used.
+            exclude_globs (Optional[List[str]]): List of glob patterns to exclude from the discovered files.
+
+        Returns:
+            Dict[str, int]: Summary dictionary with keys 'files' and 'chunks' indicating how many files and chunks were loaded.
+        """
         collection_name = collection_name or self.default_collection
         store = self._get_or_create_collection(collection_name)
 
@@ -1618,113 +1718,408 @@ class Agent:
     def search_knowledge(
         self,
         query: str,
-        k: Optional[int] = None,
         collection_name: Optional[str] = None,
     ) -> List[Dict]:
+        """Search the knowledge store for documents relevant to the query, optionally reranking with an LLM.
+
+        Performs vector search in the specified collection and, if configured, reranks top candidates using
+        the LLM reranker. Results include text, metadata, vector score, and optional rerank_score.
+
+        Args:
+            query (str): Query string to search for.
+            collection_name (Optional[str]): Collection name to search. Defaults to the instance default_collection.
+
+        Returns:
+            List[Dict]: List of result dictionaries. Each dictionary contains keys:
+                - 'text' (str): The document text/chunk.
+                - 'metadata' (dict): Associated metadata for the chunk.
+                - 'score' (float): Similarity score from the vector store (heuristic).
+
+                - 'rerank_score' (Optional[float]): Optional reranker relevance score when reranking is enabled.
+        """
         collection_name = collection_name or self.default_collection
         store = self.collections.get(collection_name)
         if not store or len(store) == 0:
             self.logger.info(f"No knowledge found in collection '{collection_name}'.")
             return []
-        k = k or self.retrieval_top_k
-        hits = store.search(query, k=k)
-        results = [{"text": t, "metadata": m, "score": s} for t, m, s in hits]
-        return results
+        hits = store.search(
+            query, k=self.retrieval_top_k
+        )  # [(text, meta, sim_score), ...]
 
-    def run(self, prompt: str, session_id: str = None, db_path: str = None):
-        """Synchronously run a prompt using the agent within an SQLite-backed session.
+        if not self._rerank_fn:
+            return [{"text": t, "metadata": m, "score": s} for t, m, s in hits]
 
-        The session defaults to an ephemeral in-memory SQLite DB unless db_path is provided.
+        try:
+            docs = [t for t, _, _ in hits]
+            metas = [m for _, m, _ in hits]
+            top_n = min(len(docs), self.rerank_top_k or len(docs))
 
-        Args:
-            prompt: Prompt text to run.
-            session_id: Optional session identifier. If not provided, a new UUID is generated.
-            db_path: Optional filesystem path for the SQLite DB. Defaults to ":memory:".
+            raw = self._rerank_fn(query, docs, metas, top_n=top_n)
+            ranked = self._normalize_rerank_result(raw, n_docs=len(docs))
+            if not ranked:
+                self.logger.debug(
+                    "Reranker returned empty/invalid result; fallback to vector order."
+                )
+                return [{"text": t, "metadata": m, "score": s} for t, m, s in hits]
 
-        Returns:
-            The result returned by agents.Runner.run (implementation-specific).
-        """
-        return agents.Runner.run(
-            self.agent,
-            prompt,
-            session=agents.SQLiteSession(
-                session_id=session_id or uuid.uuid4().hex, db_path=db_path or ":memory:"
-            ),
-        )
+            used = set()
+            reranked_results: List[Dict] = []
+            for idx, rscore in ranked:
+                t, m, s = hits[idx]
+                reranked_results.append(
+                    {"text": t, "metadata": m, "score": s, "rerank_score": rscore}
+                )
+                used.add(idx)
 
-    def run_sync(
+            for i, (t, m, s) in enumerate(hits):
+                if len(reranked_results) >= self.rerank_top_k:
+                    break
+                if i not in used:
+                    reranked_results.append({"text": t, "metadata": m, "score": s})
+
+            return reranked_results[: self.retrieval_top_k]
+        except Exception as e:
+            self.logger.warning(f"Reranking failed: {e}. Fallback to vector order.")
+            return [{"text": t, "metadata": m, "score": s} for t, m, s in hits]
+
+
+class Agent:
+    """
+    High-level wrapper that simplifies construction and interaction with an LLM-based agent.
+
+    The Agent wrapper configures an OpenAI-compatible client, logging, optional tracing,
+    and constructs an underlying agents.Agent instance. It provides convenient synchronous,
+    asynchronous, and streaming run methods that use an SQLite-backed session by default.
+    It also supports retrieval-augmented generation (RAG) via an optional Collection, built-in
+    helper tools for exporting and retrieving conversations, and a mechanism to expose the
+    agent as a tool to other agents.
+
+    Key responsibilities:
+      - Load environment configuration and initialize the model client.
+      - Configure tracing and logging.
+      - Register callable tools and agents-compatible function tools.
+      - Provide prompt augmentation using retrieval from a Collection (RAG).
+      - Offer run, run_sync, run_streamed, and stream interfaces that persist conversations to SQLite sessions.
+
+    Attributes:
+        logger (logging.Logger): Logger configured for this wrapper.
+        agent (agents.Agent): Underlying agent instance that performs reasoning, tool calls, and messaging.
+        model (LitellmModel): Model client used by the underlying agent.
+        model_settings (agents.ModelSettings): Model settings forwarded to the agent.
+        tools (dict): Mapping of tool name to callable for convenience tools.
+        function_tools (List[agents.Tool]): List of agents-compatible function tools registered on the agent.
+        handoff_agents (List[agents.Agent]): List of agents to which the wrapper can hand off control.
+        preset_prompts (dict): Optional preset prompts for common tasks.
+        collection (Collection | None): Optional knowledge collection used for RAG augmentation.
+        rag_prompt_template (str): Template used to format augmented prompts with retrieved context.
+        rag_max_context (int): Maximum total length of concatenated context used for RAG.
+
+    Example:
+        >>> agent = Agent(model_name="gpt-4", log_level="DEBUG", collection=my_collection)
+        >>> result = agent.run("Summarize the conversation.")
+    """
+
+    def __init__(
         self,
-        prompt: str,
+        base_url: str = None,
+        api_key: str = None,
+        name: str = "Agent",
+        log_file: str = None,
+        log_level: str = "INFO",
+        model_name: str = None,
+        model_settings: dict = None,
+        instructions: str = "You are a helpful assistant.",
+        preset_prompts: dict = None,
+        tools: List[agents.FunctionTool] = None,
+        tool_use_behavior: str = "run_llm_again",
+        handoffs: List[agents.Agent] = None,
+        output_type: str = None,
+        input_guardrails: List[agents.InputGuardrail] = None,
+        output_guardrails: List[agents.OutputGuardrail] = None,
+        default_openai_api: str = "chat_completions",
+        trace_disabled: bool = True,
+        collection: Collection = None,
+        rag_max_context: int = 6000,
+        rag_prompt_template: str = None,
         session_id: str = None,
-        db_path: str = None,
-        use_knowledge: Optional[bool] = None,
-        collection_name: Optional[str] = None,
-        top_k: Optional[int] = None,
+        session_db: Union[Path, str] = ":memory:",
     ):
-        """Run a prompt synchronously using the agent (blocking).
-
-        This wraps agents.Runner.run_sync and uses an SQLiteSession similar to run().
-
-        Args:
-            prompt: Prompt text to run.
-            session_id: Optional session identifier. If not provided, a new UUID is generated.
-            db_path: Optional filesystem path for the SQLite DB. Defaults to ":memory:".
-
-        Returns:
-            The result returned by agents.Runner.run_sync (implementation-specific).
         """
-        prompt_to_run = self._maybe_augment_prompt(
-            prompt=prompt,
-            use_knowledge=use_knowledge,
-            collection_name=collection_name,
-            top_k=top_k,
-        )
-        return agents.Runner.run_sync(
-            self.agent,
-            prompt_to_run,
-            session=agents.SQLiteSession(
-                session_id=session_id or uuid.uuid4().hex, db_path=db_path or ":memory:"
-            ),
-        )
+        Initialize the Agent wrapper, configure OpenAI client, tracing, logging, and set up the underlying agent.
 
-    async def run_streamed(
-        self,
-        prompt: str,
-        session_id: str = None,
-        db_path: str = None,
-        use_knowledge: Optional[bool] = None,
-        collection_name: Optional[str] = None,
-        top_k: Optional[int] = None,
-    ):
-        """Run a prompt and process stream events asynchronously.
-
-        The method iterates over the async event stream produced by agents.Runner.run_streamed
-        and logs the important events. It intentionally ignores raw response deltas and only
-        handles agent updates, tool calls, tool outputs, and message outputs.
+        This initializer:
+        - Loads environment variables.
+        - Configures OpenAI client based on inputs or environment variables.
+        - Enables or disables tracing.
+        - Sets up logging based on given log level and file.
+        - Creates the internal agents.Agent instance with provided settings.
 
         Args:
-            prompt: Prompt text to run.
-            session_id: Optional session identifier. If not provided, a new UUID is generated.
-            db_path: Optional filesystem path for the SQLite DB. Defaults to ":memory:".
+            base_url (str, optional): Base URL for the OpenAI client. Defaults to environment variable OPENAI_BASE_URL if not set.
+            api_key (str, optional): API key for the OpenAI client. Defaults to environment variable OPENAI_API_KEY if not set.
+            name (str): Name of the agent wrapper and underlying agent.
+            log_file (str, optional): Path to file for logging output.
+            log_level (str): Logging verbosity level (e.g. "INFO", "DEBUG").
+            model_name (str, optional): Name of the model to use. Defaults to environment variable OPENAI_MODEL_NAME if not set.
+            model_settings (dict, optional): Additional model configuration forwarded to agents.ModelSettings.
+            instructions (str): High-level instructions for the underlying agent.
+            preset_prompts (dict, optional): Dictionary of preset prompts for common tasks.
+            tools (List[agents.FunctionTool], optional): List of tool descriptors or callables to add to the agent.
+            tool_use_behavior (str): Strategy for how tools are used by the agent.
+            handoffs (List[agents.Agent], optional): List of handoff agents.
+            output_type (str, optional): Optional output type annotation for the agent.
+            input_guardrails (List[agents.InputGuardrail], optional): List of input guardrails to enforce.
+            output_guardrails (List[agents.OutputGuardrail], optional): List of output guardrails to enforce.
+            default_openai_api (str): Default OpenAI API endpoint to use (e.g. "chat_completions").
+            trace_disabled (bool): If True, disables tracing features.
+            collection (Collection, optional): Knowledge collection for retrieval-augmented generation (RAG).
+            rag_max_context (int): Maximum total context length for RAG augmentation.
+            rag_prompt_template (str, optional): Template string for prompt augmentation with retrieved context.
+            session_id (str, optional): Session ID, if not specified, a uuid-4 string will be applied.
+            session_db (str, optional): Path to session database file (sqlite), if not specified, in-memory database will be used.
 
         Returns:
             None
         """
-        session = agents.SQLiteSession(
-            session_id=session_id or uuid.uuid4().hex, db_path=db_path or ":memory:"
+        dotenv.load_dotenv()
+        agents.set_default_openai_api(api=default_openai_api)
+        agents.set_tracing_disabled(disabled=trace_disabled)
+        self.logger = setup_logger(name, file=log_file, level=log_level)
+
+        self.handoff_agents = []
+        for handoff in handoffs or []:
+            if isinstance(handoff, Agent):
+                self.handoff_agents.append(handoff.agent)
+            elif isinstance(handoff, agents.Agent):
+                self.handoff_agents.append(handoff)
+            else:
+                self.logger.warning(
+                    "handoffs must be BaseAgent or agents.Agent instances"
+                )
+
+        self.function_tools = []
+        self.tools = {
+            "export_conversation": self.export_conversation,
+            "get_conversation": self.get_conversation,
+        }
+        for fnt in tools or []:
+            if isinstance(fnt, agents.Tool):
+                self.function_tools.append(fnt)
+            elif callable(fnt):
+                self.tools[fnt.__name__] = fnt
+                self.function_tools.append(agents.function_tool(fnt))
+            else:
+                self.logger.warning("tools must be agents.Tool or callable instances")
+
+        self.model = LitellmModel(
+            model=model_name or os.getenv("OPENAI_MODEL_NAME"),
+            base_url=base_url or os.getenv("OPENAI_BASE_URL"),
+            api_key=api_key or os.getenv("OPENAI_API_KEY"),
         )
 
+        model_settings = model_settings or dict()
+        if isinstance(model_settings, dict):
+            model_settings.update({"include_usage": True})
+            self.model_settings = agents.ModelSettings(**model_settings)
+        elif isinstance(model_settings, agents.ModelSettings):
+            self.model_settings = model_settings
+        elif not isinstance(model_settings, agents.ModelSettings):
+            self.logger.warning(
+                "model_settings must be a dict or agents.ModelSettings instance"
+            )
+
+        self.collection = collection
+        if not isinstance(self.collection, Collection):
+            self.collection = None
+            self.logger.warning("collections must be Collection instances")
+        self.rag_max_context = rag_max_context
+
+        self.agent = agents.Agent(
+            name=name,
+            instructions=instructions,
+            output_type=output_type,
+            tools=self.function_tools,
+            tool_use_behavior=tool_use_behavior,
+            handoffs=self.handoff_agents,
+            model=self.model,
+            model_settings=self.model_settings,
+            input_guardrails=input_guardrails or list(),
+            output_guardrails=output_guardrails or list(),
+        )
+        self.preset_prompts = preset_prompts or dict()
+        self.rag_prompt_template = rag_prompt_template or (
+            "You are a helpful assistant. Use the following context to answer the question. "
+            "If the context is not sufficient, say you don't know.\n\n"
+            "Context:\n{context}\n\n"
+            "Question:\n{question}"
+        )
+
+        self.session_id = session_id or uuid.uuid4().hex
+        self.session_db = session_db
+        self.session = agents.SQLiteSession(
+            session_id=self.session_id, db_path=self.session_db
+        )
+
+    # ----------------- Built-in Tools -----------------
+
+    # ----------------- Internal helpers -----------------
+
+    def __str__(self):
+        return str(self.agent)
+
+    def __repr__(self):
+        self.__str__()
+
+    # ----------------- Internal helpers -----------------
+
+    def _build_context_from_hits(self, hits: List[Dict]) -> str:
+        """
+        Build a concatenated context string from a list of knowledge base search hits.
+
+        This limits the total length of the accumulated context to self.rag_max_context.
+
+        Args:
+            hits (List[Dict]): List of knowledge search result documents.
+
+        Returns:
+            str: Concatenated context string constructed from the hits.
+        """
+        if not hits:
+            return ""
+        parts = []
+        total = 0
+        for h in hits:
+            src = h.get("metadata", {}).get("source", "unknown")
+            snippet = h["text"].strip().replace("\n", " ").strip()
+            piece = f"[source: {src}]\n{snippet}\n"
+            if total + len(piece) > self.rag_max_context:
+                break
+            parts.append(piece)
+            total += len(piece)
+        return "\n".join(parts)
+
+    def _maybe_augment_prompt(
+        self,
+        prompt: str,
+        use_knowledge: Optional[bool] = False,
+        collection_name: Optional[str] = "default",
+    ) -> str:
+        """
+        Conditionally augment the prompt input using retrieval from the knowledge collection.
+
+        If knowledge usage is enabled and a collection is present, the prompt is augmented with
+        relevant context retrieved from the collection, formatted according to the RAG template.
+
+        Args:
+            prompt (str): Original prompt text.
+            use_knowledge (Optional[bool]): Whether to augment prompt using the knowledge base.
+            collection_name (Optional[str]): Name of the collection to query in the knowledge base.
+
+        Returns:
+            str: Augmented prompt if applicable, otherwise original prompt.
+        """
+        if self.collection is None or not use_knowledge:
+            return prompt
+
+        collection_name = collection_name or self.collection.default_collection
+
+        try:
+            hits = self.collection.search_knowledge(
+                prompt, collection_name=collection_name
+            )
+            if not hits:
+                return prompt
+            context = self._build_context_from_hits(hits)
+            if not context.strip():
+                return prompt
+            aug = self.rag_prompt_template.format(context=context, question=prompt)
+            return aug
+        except Exception as e:
+            self.logger.warning(
+                f"RAG augmentation failed, fallback to original prompt. Err: {e}"
+            )
+            return prompt
+
+    # ----------------- Public interfaces -----------------
+
+    def as_tool(self, tool_name: str, tool_description: str):
+        """
+        Expose this agent as a tool descriptor compatible with agents.Tool.
+
+        This acts as a wrapper around the underlying agent's as_tool method.
+
+        Args:
+            tool_name (str): Name to expose for the tool.
+            tool_description (str): Description of the tool's functionality.
+
+        Returns:
+            agents.Tool: A Tool descriptor instance for integration with other agents.
+        """
+        return self.agent.as_tool(
+            tool_name=tool_name, tool_description=tool_description
+        )
+
+    def export_conversation(self, output_file: str, limit: int = None):
+        """
+        Export an SQLite session's conversation history to a JSON file.
+
+        Args:
+            output_file (str): Path to the JSON file to save the exported conversation.
+            limit (int): Limit number of conversation
+
+        Returns:
+            None
+        """
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(
+                self.get_conversation(limit),
+                f,
+                indent=2,
+            )
+
+    def get_conversation(self, limit: int = None):
+        """
+        Retrieve the conversation history for a given SQLite session.
+
+        Args:
+            limit (int): Limit number of conversation
+
+        Returns:
+            List[Dict]: List of conversation items in the session.
+        """
+        return asyncio.run(self.session.get_items(limit))
+
+    async def stream(
+        self,
+        prompt: str,
+        use_knowledge: Optional[bool] = None,
+        collection_name: Optional[str] = None,
+    ):
+        """
+        Asynchronously run a prompt and process streaming response events.
+
+        Iterates over streamed events emitted by agents.Runner.run_streamed, handling and logging
+        significant events like agent updates, tool calls and outputs, and message outputs.
+
+        Args:
+            prompt (str): Prompt text to execute.
+            use_knowledge (Optional[bool], optional): Whether to augment prompt with knowledge base context.
+            collection_name (Optional[str], optional): Name of the knowledge collection to use.
+
+        Returns:
+            agents.Runner: The Runner instance representing the ongoing execution.
+        """
+        use_knowledge = True if self.collection else False
         prompt_to_run = self._maybe_augment_prompt(
             prompt=prompt,
             use_knowledge=use_knowledge,
             collection_name=collection_name,
-            top_k=top_k,
         )
 
         result = agents.Runner.run_streamed(
             self.agent,
             prompt_to_run,
-            session=session,
+            session=self.session,
         )
         async for event in result.stream_events():
             # We'll print streaming delta if available
@@ -1732,113 +2127,123 @@ class Agent:
                 event.data, ResponseTextDeltaEvent
             ):
                 print(event.data.delta, end="", flush=True)
+            elif event.type == "raw_response_event" and isinstance(
+                event.data, ResponseContentPartDoneEvent
+            ):
+                print()
             elif event.type == "agent_updated_stream_event":
                 self.logger.debug(f"Agent updated: {event.new_agent.name}")
             elif event.type == "run_item_stream_event":
                 if event.item.type == "tool_call_item":
                     self.logger.info(
-                        f"{'-' * 20} Tool was called: {'-' * 20}\n{event.item.raw_item.name}(arguments: {event.item.raw_item.arguments})"
+                        f"<TOOL_CALL> {event.item.raw_item.name}(arguments: {event.item.raw_item.arguments})"
                     )
                 elif event.item.type == "tool_call_output_item":
-                    self.logger.info(
-                        f"{'-' * 20} Tool output: {'-' * 20} \n{event.item.output}"
-                    )
+                    self.logger.info(f"<TOOL_OUTPUT> {event.item.output}")
                 elif event.item.type == "message_output_item":
                     self.logger.info(
-                        f"{'-' * 20} Message output: {'-' * 20}\n {agents.ItemHelpers.text_message_output(event.item)}"
+                        f"<MESSAGE> {agents.ItemHelpers.text_message_output(event.item)}"
                     )
                 else:
                     pass
+
         return result
 
-    async def acli(
-        self, stream: bool = True, session_id: str = None, db_path: str = None
+    # ----------------- Running triggers -----------------
+
+    def run(
+        self,
+        prompt: str,
+        use_knowledge: Optional[bool] = None,
+        collection_name: Optional[str] = None,
     ):
         """
-        Asynchronous interactive CLI entrypoint.
+        Synchronously run a prompt using the agent inside an SQLite-backed session.
 
-        Supports the following commands:
-          - Enter any prompt to ask the Agent a question.
-          - Enter a command starting with `/` to invoke a preset prompt, e.g. `/summarize`.
-          - Enter a command starting with `!` to execute a local shell command, e.g. `!ls`.
-          - Enter `exit` or `quit` to exit the CLI.
-          - Commands starting with `#` are reserved for future knowledge management (not implemented).
+        Defaults to using an ephemeral in-memory SQLite database unless a persistent db_path is provided.
+
         Args:
-            stream: If True, uses streaming output (async event stream). If False, uses synchronous output.
-            session_id: Optional session ID. If None, generates a random session.
-            db_path: Optional SQLite DB file path. If None, uses in-memory database.
-        Returns:
-            None
-        """
-        session_id = session_id or uuid.uuid4().hex
-        db_path = db_path or ":memory:"
-
-        while True:
-            use_knowledge = False
-            try:
-                user_input = input(" >>> ")
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
-            if user_input.strip().lower() in {"exit", "quit"}:
-                break
-            elif user_input.startswith("/"):
-                user_input = user_input[1:].strip()
-                if user_input in self.preset_prompts:
-                    user_input = self.preset_prompts[user_input]
-                else:
-                    print(f"Unknown preset prompt: {user_input}")
-                    continue
-            elif user_input.startswith("#"):
-                use_knowledge = True
-                cmd = user_input[1:].strip()
-                if cmd.startswith("search "):
-                    q = cmd[len("search ") :].strip()
-                    hits = self.search_knowledge(q)
-                    for i, h in enumerate(hits, 1):
-                        print(
-                            f"[{i}] score={h['score']:.4f}, source={h['metadata'].get('source')}"
-                        )
-                        print(h["text"][:500], "...\n")
-                    continue
-                else:
-                    pass
-            elif user_input.startswith("!"):
-                user_input = user_input[1:].strip()
-                subprocess.run(user_input, shell=True)
-                continue
-            elif not user_input:
-                continue
-
-            result: agents.RunResult
-            if stream:
-                result = await self.run_streamed(
-                    prompt=user_input,
-                    session_id=session_id,
-                    db_path=db_path,
-                    use_knowledge=use_knowledge,
-                )
-            else:
-                result = await self.run(
-                    prompt=user_input,
-                    session_id=session_id,
-                    db_path=db_path,
-                    use_knowledge=use_knowledge,
-                )
-            if result.final_output is not None:
-                self.logger.info(result.final_output)
-
-    def cli(self, stream: bool = True, session_id: str = None, db_path: str = None):
-        """
-        Launch interactive CLI (synchronous, blocking main thread).
-
-        This method wraps the asynchronous acli CLI in asyncio.run(), allowing synchronous invocation.
-        Args:
-            stream: If True, uses streaming output.
-            session_id: Optional session ID.
-            db_path: Optional SQLite DB file path.
+            prompt (str): Text prompt to run.
+            use_knowledge (Optional[bool], optional): Whether to utilize knowledge base augmentation.
+            collection_name (Optional[str], optional): Name of the knowledge collection to query.
 
         Returns:
-            None
+            Any: Result from agents.Runner.run execution (implementation-specific).
         """
-        asyncio.run(self.acli(stream=stream, session_id=session_id, db_path=db_path))
+        use_knowledge = True if self.collection else False
+        prompt_to_run = self._maybe_augment_prompt(
+            prompt=prompt,
+            use_knowledge=use_knowledge,
+            collection_name=collection_name,
+        )
+        return agents.Runner.run(
+            self.agent,
+            prompt_to_run,
+            session=self.session,
+        )
+
+    def run_sync(
+        self,
+        prompt: str,
+        use_knowledge: Optional[bool] = None,
+        collection_name: Optional[str] = None,
+    ):
+        """
+        Blocking call to run a prompt synchronously using the agent.
+
+        Wraps agents.Runner.run_sync with an SQLite-backed session.
+
+        Args:
+            prompt (str): Prompt text to execute.
+            use_knowledge (Optional[bool], optional): Flag to enable prompt augmentation.
+            collection_name (Optional[str], optional): Knowledge collection name to use for augmentation.
+
+        Returns:
+            Any: Result returned by agents.Runner.run_sync (implementation-specific).
+        """
+        use_knowledge = True if self.collection else False
+        prompt_to_run = self._maybe_augment_prompt(
+            prompt=prompt,
+            use_knowledge=use_knowledge,
+            collection_name=collection_name,
+        )
+        return agents.Runner.run_sync(
+            self.agent,
+            prompt_to_run,
+            session=self.session,
+        )
+
+    def run_streamed(
+        self,
+        prompt: str,
+        use_knowledge: Optional[bool] = None,
+        collection_name: Optional[str] = None,
+    ):
+        """
+        Run a prompt with the agent and process the output in a streaming fashion synchronously.
+
+        This method runs the asynchronous stream internally via asyncio.run and yields the streamed output.
+
+        Args:
+            prompt (str): Prompt text to run.
+            session_id (str, optional): Optional conversation session ID; generates new UUID if None.
+            db_path (str, optional): Path to SQLite DB file; defaults to ":memory:".
+            use_knowledge (Optional[bool], optional): Whether to augment prompt from knowledge base.
+            collection_name (Optional[str], optional): Name of the knowledge collection.
+
+        Returns:
+            agents.Runner: The Runner instance representing the streamed execution.
+        """
+        use_knowledge = True if self.collection else False
+        prompt_to_run = self._maybe_augment_prompt(
+            prompt=prompt,
+            use_knowledge=use_knowledge,
+            collection_name=collection_name,
+        )
+        return asyncio.run(
+            self.stream(
+                prompt_to_run,
+                use_knowledge=use_knowledge,
+                collection_name=collection_name,
+            )
+        )
