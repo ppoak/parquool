@@ -1415,7 +1415,7 @@ class Collection:
             resp = litellm.embedding(
                 model=self.embedding_model,
                 input=texts,
-                base_url=self.base_url,
+                api_base=self.base_url,
                 api_key=self.api_key,
             )
             return [d["embedding"] for d in resp.data]
@@ -1559,7 +1559,7 @@ class Collection:
                 documents=docs,
                 top_n=top_n,
                 return_documents=False,
-                base_url=self.base_url,
+                api_base=self.base_url,
                 api_key=self.api_key,
             )
 
