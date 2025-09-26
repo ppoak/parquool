@@ -10,7 +10,18 @@ import uuid
 from copy import deepcopy
 from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union, Callable, Tuple, Literal
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Union,
+    Callable,
+    Tuple,
+    Literal,
+    TYPE_CHECKING,
+)
 
 import logging
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
@@ -24,7 +35,6 @@ from email.mime.text import MIMEText
 
 import dotenv
 import agents
-import chromadb
 import litellm
 import requests
 import markdown
@@ -33,6 +43,10 @@ import pandas as pd
 from retry import retry
 from openai.types.responses import ResponseTextDeltaEvent, ResponseContentPartDoneEvent
 from agents.extensions.models.litellm_model import LitellmModel
+
+
+if TYPE_CHECKING:
+    import chromadb
 
 
 def setup_logger(
@@ -1217,7 +1231,7 @@ class Collection:
     class _ChromaVectorStore:
 
         def __init__(
-            self, client: chromadb.PersistentClient, name: str, embed_fn: Callable
+            self, client: "chromadb.PersistentClient", name: str, embed_fn: Callable
         ):
             """Initialize an internal Chroma-backed vector store wrapper.
 
@@ -1328,6 +1342,12 @@ class Collection:
 
         """
         dotenv.load_dotenv()
+        try:
+            import chromadb
+        except:
+            raise ImportError(
+                'Chroma backend not found, please install with `pip install "parquool[knowledge]"`'
+            )
         self.base_url = (
             base_url or os.getenv("LITELLM_BASE_URL") or "https://api.openai.com/v1"
         )
@@ -2412,15 +2432,9 @@ class Agent:
         Returns:
             agents.Runner: The Runner instance representing the streamed execution.
         """
-        use_knowledge = True if self.collection else False
-        prompt_to_run = self._maybe_augment_prompt(
-            prompt=prompt,
-            use_knowledge=use_knowledge,
-            collection_name=collection_name,
-        )
         return asyncio.run(
             self.stream(
-                prompt_to_run,
+                prompt,
                 use_knowledge=use_knowledge,
                 collection_name=collection_name,
             )
