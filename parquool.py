@@ -1930,9 +1930,9 @@ class Agent:
                 self.logger.warning("tools must be agents.Tool or callable instances")
 
         self.model = LitellmModel(
-            model=model_name or os.getenv("LITELLM_MODEL_NAME"),
-            base_url=base_url or os.getenv("LITELLM_BASE_URL"),
+            base_url=base_url or os.getenv("LITELLM_BASE_URL") or "https://api.openai.com/v1",
             api_key=api_key or os.getenv("LITELLM_API_KEY"),
+            model=model_name or os.getenv("LITELLM_MODEL_NAME"),
         )
 
         model_settings = model_settings or dict()
