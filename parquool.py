@@ -20,6 +20,7 @@ from typing import (
     Callable,
     Tuple,
     Literal,
+    AsyncIterator,
     TYPE_CHECKING,
 )
 
@@ -2292,12 +2293,11 @@ class Agent:
         prompt: str,
         use_knowledge: Optional[bool] = None,
         collection_name: Optional[str] = None,
-    ):
+    ) -> AsyncIterator:
         """
-        Asynchronously run a prompt and process streaming response events.
+        Asynchronously iterator to run a prompt and process streaming response events.
 
-        Iterates over streamed events emitted by agents.Runner.run_streamed, handling and logging
-        significant events like agent updates, tool calls and outputs, and message outputs.
+        Iterates over streamed events emitted by agents.Runner.run_streamed
 
         Args:
             prompt (str): Prompt text to execute.
@@ -2305,7 +2305,7 @@ class Agent:
             collection_name (Optional[str], optional): Name of the knowledge collection to use.
 
         Returns:
-            agents.Runner: The Runner instance representing the ongoing execution.
+            None
         """
         use_knowledge = True if self.collection else False
         prompt_to_run = self._maybe_augment_prompt(
@@ -2320,36 +2320,11 @@ class Agent:
             session=self.session,
         )
         async for event in result.stream_events():
-            # We'll print streaming delta if available
-            if event.type == "raw_response_event" and isinstance(
-                event.data, ResponseTextDeltaEvent
-            ):
-                print(event.data.delta, end="", flush=True)
-            elif event.type == "raw_response_event" and isinstance(
-                event.data, ResponseContentPartDoneEvent
-            ):
-                print()
-            elif event.type == "agent_updated_stream_event":
-                self.logger.debug(f"Agent updated: {event.new_agent.name}")
-            elif event.type == "run_item_stream_event":
-                if event.item.type == "tool_call_item":
-                    self.logger.info(
-                        f"<TOOL_CALL> {event.item.raw_item.name}(arguments: {event.item.raw_item.arguments})"
-                    )
-                elif event.item.type == "tool_call_output_item":
-                    self.logger.info(f"<TOOL_OUTPUT> {event.item.output}")
-                elif event.item.type == "message_output_item":
-                    self.logger.info(
-                        f"<MESSAGE> {agents.ItemHelpers.text_message_output(event.item)}"
-                    )
-                else:
-                    pass
-
-        return result
+            yield event
 
     # ----------------- Running triggers -----------------
 
-    def run(
+    async def run(
         self,
         prompt: str,
         use_knowledge: Optional[bool] = None,
@@ -2411,16 +2386,16 @@ class Agent:
             session=self.session,
         )
 
-    def run_streamed(
+    async def run_streamed(
         self,
         prompt: str,
         use_knowledge: Optional[bool] = None,
         collection_name: Optional[str] = None,
     ):
         """
-        Run a prompt with the agent and process the output in a streaming fashion synchronously.
+        Run a prompt with the agent and process the output in a streaming fashion asynchronously.
 
-        This method runs the asynchronous stream internally via asyncio.run and yields the streamed output.
+        This method runs the asynchronous stream internally and processed the yield output from `stream`.
 
         Args:
             prompt (str): Prompt text to run.
@@ -2430,11 +2405,62 @@ class Agent:
             collection_name (Optional[str], optional): Name of the knowledge collection.
 
         Returns:
-            agents.Runner: The Runner instance representing the streamed execution.
+            None
         """
-        return asyncio.run(
-            self.stream(
-                prompt,
+
+        events = self.stream(
+            prompt,
+            use_knowledge=use_knowledge,
+            collection_name=collection_name,
+        )
+        async for event in events:
+            # We'll print streaming delta if available
+            if event.type == "raw_response_event" and isinstance(
+                event.data, ResponseTextDeltaEvent
+            ):
+                print(event.data.delta, end="", flush=True)
+            elif event.type == "raw_response_event" and isinstance(
+                event.data, ResponseContentPartDoneEvent
+            ):
+                print()
+            elif event.type == "agent_updated_stream_event":
+                self.logger.debug(f"Agent updated: {event.new_agent.name}")
+            elif event.type == "run_item_stream_event":
+                if event.item.type == "tool_call_item":
+                    self.logger.info(
+                        f"<TOOL_CALL> {event.item.raw_item.name}(arguments: {event.item.raw_item.arguments})"
+                    )
+                elif event.item.type == "tool_call_output_item":
+                    self.logger.info(f"<TOOL_OUTPUT> {event.item.output}")
+                elif event.item.type == "message_output_item":
+                    self.logger.info(
+                        f"<MESSAGE> {agents.ItemHelpers.text_message_output(event.item)}"
+                    )
+                else:
+                    pass
+
+    def run_streamed_sync(
+        self,
+        prompt: str,
+        use_knowledge: Optional[bool] = None,
+        collection_name: Optional[str] = None,
+    ):
+        """
+        Run a prompt with the agent and process the output in a streaming fashion synchronously.
+
+        Args:
+            prompt (str): Prompt text to run.
+            session_id (str, optional): Optional conversation session ID; generates new UUID if None.
+            db_path (str, optional): Path to SQLite DB file; defaults to ":memory:".
+            use_knowledge (Optional[bool], optional): Whether to augment prompt from knowledge base.
+            collection_name (Optional[str], optional): Name of the knowledge collection.
+
+        Returns:
+            None
+        """
+        asyncio.run(
+            self.run_streamed(
+                prompt=prompt,
                 use_knowledge=use_knowledge,
                 collection_name=collection_name,
             )
