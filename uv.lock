@@ -1981,7 +1981,6 @@ dependencies = [
     { name = "pandas" },
     { name = "requests" },
     { name = "retry" },
-    { name = "serpapi" },
 ]
 
 [package.optional-dependencies]
@@ -1989,6 +1988,9 @@ knowledge = [
     { name = "chromadb" },
     { name = "pypdf" },
     { name = "python-docx" },
+]
+websearch = [
+    { name = "serpapi" },
 ]
 
 [package.metadata]
@@ -2006,7 +2008,7 @@ requires-dist = [
     { name = "python-docx", marker = "extra == 'knowledge'", specifier = ">=1.2.0" },
     { name = "requests", specifier = ">=2.32" },
     { name = "retry", specifier = ">=0.9" },
-    { name = "serpapi", specifier = ">=0.1.5" },
+    { name = "serpapi", marker = "extra == 'websearch'", specifier = ">=0.1.0" },
 ]
 provides-extras = ["knowledge", "websearch"]
 

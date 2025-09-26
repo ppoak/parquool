@@ -2047,7 +2047,7 @@ class Agent:
             break
 
         else:
-            return f"All {len(api_keys)} tried, none success, check the environment variable SERPAPI_KEY for your api key"
+            return f"Request failed, please check your parameter and try again."
 
         search_metadata = result["search_metadata"]
         search_report = (
@@ -2169,7 +2169,7 @@ class Agent:
         return str(self.agent)
 
     def __repr__(self):
-        self.__str__()
+        return self.__str__()
 
     # ----------------- Internal helpers -----------------
 
