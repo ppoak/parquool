@@ -1,112 +1,195 @@
 # Parquool
 
-Parquool is a lightweight Python library that makes working with Parquet datasets feel like working with a SQL table. It leverages DuckDB for fast SQL querying over parquet files and provides convenient utilities for partitioned writes, row-level upsert/update/delete operations, logging, HTTP proxy requests with retry, email task notifications, and an OpenAI Agent wrapper.
+Parquool (package name: parquool) is a lightweight Python library that provides SQL-like querying for parquet datasets, partitioned writes, row-level upsert/update/delete operations, and other convenient data engineering helpers. It also includes some utility functions (logging, HTTP proxy requests, a task notification decorator) and an Agent wrapper built on openai-agents, together with a companion knowledge management tool called Collection.
 
-Key features
-- Create a DuckDB view over a parquet dataset (parquet_scan) and query it using SQL-like methods.
-- Upsert (merge) data from pandas DataFrames using primary keys, with optional partitioned output.
-- Perform atomic update and delete operations that rewrite parquet directories safely.
-- Helpers for pivoting (DuckDB PIVOT and pandas.pivot_table), counting and general SELECT operations that return pandas.DataFrame.
-- Utilities: configurable logger (with rotation), proxy_request with retries, notify_task decorator for email notifications, and BaseAgent built on openai-agents for conversational workflows.
+The library aims to simplify common data management scenarios when using parquet files as storage locally or on a server. It uses DuckDB for high-performance SQL queries and supports writing query results back as partitioned parquet files. The Agent class provides a convenient, out-of-the-box interface to openai-agents. Collection offers an easy-to-use knowledge management tool that helps users quickly embed knowledge into a vector database for LLM access.
 
-## Install
+## Key Features
 
-Install from PyPI:
+- Create DuckDB views with parquet_scan to query parquet data as if they were database tables.
+- Support upsert (merge) semantics based on primary keys, with optional partitioned writes (partition_by).
+- Support SQL-based update and delete operations and atomically replace directory contents to guarantee consistency.
+- Provide pandas-friendly select, pivot (DuckDB pivot and pandas pivot_table) and count methods.
+- Includes utilities: configurable logger, proxy_request with retry, and notify_task email notification decorator.
+- Agent wrapper integrated with openai-agents for easy agent creation and usage.
+- Knowledge management based on chromadb for vector store integration — useful for embedding content for Agents.
+
+## Installation
+
+We recommend installing via pip:
 
 ```bash
 pip install parquool
 ```
 
-(Dependencies are declared in pyproject.toml and include duckdb, pandas, openai-agents, requests, retry, etc.)
+For knowledge integration, install:
 
-## Quick start — DuckParquet
+```bash
+pip install "parquool[knowledge]"
+```
 
-This demonstrates common operations: create, select, upsert, update, delete.
+For web search tool integration, install:
 
-```python
-# file: example.py
+```bash
+pip install "parquool[websearch]"
+```
+
+## Quick Start — DuckParquet
+
+Below is a demonstration of common usage: creating a DuckParquet instance, querying, upserting, updating and deleting.
+
+```python parquool.py
 from parquool import DuckParquet
 import pandas as pd
 
-# Open (or create) a dataset directory
+# Open a directory (created if it does not exist)
 dp = DuckParquet('data/my_dataset')
 
-# Query (like SELECT)
+# Query (equivalent to SELECT * FROM view)
 df = dp.select(columns=['id', 'value'], where='value > 10', limit=100)
 print(df.head())
 
-# Upsert: provide primary key columns
+# upsert: insert or update (must provide primary key columns)
 new = pd.DataFrame([{'id': 1, 'value': 42}, {'id': 2, 'value': 99}])
 dp.upsert_from_df(new, keys=['id'], partition_by=['id'])
 
-# Update: set column values using expressions or Python values
+# update: update column values by condition
 dp.update(set_map={'value': 0}, where='value < 0')
 
-# Delete: remove rows matching condition
+# delete: remove rows matching the condition
 dp.delete(where="id = 3")
 ```
 
-## Primary classes and methods
+## Main Classes and Methods Overview
 
 - DuckParquet(dataset_path, name=None, db_path=None, threads=None)
-  - select(...): flexible query returning pandas.DataFrame; supports where, group_by, order_by, limit, distinct.
-  - dpivot(...): uses DuckDB PIVOT to produce wide tables.
-  - ppivot(...): uses pandas.pivot_table for wide pivoting.
-  - count(where=None): row count.
-  - upsert_from_df(df, keys, partition_by=None): upsert by keys, supports partitioned output.
-  - update(set_map, where=None, partition_by=None): update columns and atomically replace parquet files.
-  - delete(where, partition_by=None): delete rows and atomically replace parquet files.
-  - refresh(): recreate the DuckDB view (call if files changed externally).
+  - select(...): General query interface supporting where, group_by, order_by, limit, distinct, etc.
+  - dpivot(...): Perform wide-table pivot using DuckDB's PIVOT syntax.
+  - ppivot(...): Perform pivot using pandas.pivot_table.
+  - count(where=None): Count rows.
+  - upsert_from_df(df, keys, partition_by=None): Upsert by keys, supports partitioning.
+  - update(set_map, where=None, partition_by=None): Update columns using SQL expressions or values and overwrite the parquet directory.
+  - delete(where, partition_by=None): Delete rows matching where and overwrite the parquet directory.
+  - refresh(): Recreate or replace the DuckDB view (call after manual file changes).
 
 ### Utilities
 
 - setup_logger(name, level='INFO', file=None, rotation=None, ...)
-  - Create a logger with optional file output and rotation (size or time).
+  - Quickly create a logger with optional file handler (supports rotation by size or time).
 
 - proxy_request(url, method='GET', proxies=None, delay=1, **kwargs)
-  - Attempts requests through provided proxies in order, falls back to direct request; decorated with retry.
+  - HTTP request helper with retry support; tries provided proxies in order and falls back to direct connection.
 
 - notify_task(sender=None, password=None, receiver=None, smtp_server=None, smtp_port=None, cc=None)
-  - A decorator that sends an email after the decorated function runs (success or failure). It formats pandas outputs as markdown, can embed local images (CID) and attach files found in markdown links. SMTP config can come from environment variables.
+  - A function decorator that sends an email notification after a task succeeds or fails. It supports converting pandas.DataFrame/Series to Markdown; can embed local images (CID) or attach files in the Markdown content.
+  - Configurable through environment variables: NOTIFY_TASK_SENDER, NOTIFY_TASK_PASSWORD, NOTIFY_TASK_RECEIVER, NOTIFY_TASK_SMTP_SERVER, NOTIFY_TASK_SMTP_PORT, NOTIFY_TASK_CC.
+  - Note: There is a remark in the source code indicating smtp_port may be assigned incorrectly — please verify configuration before use.
 
-Note: The implementation contains a note in the source about a potential bug where smtp_port may be incorrectly assigned; please verify your SMTP configuration before use.
+### Agent Wrapper — Agent
 
-## BaseAgent (OpenAI agent wrapper)
+BaseAgent wraps openai-agents with common initialization logic:
+- It reads environment variables (LITELLM_BASE_URL, LITELLM_API_KEY, LITELLM_MODEL_NAME, etc.) and configures a default litellm client.
+- Provides run/run_sync/run_streamed/cli methods for executing prompts, streaming output, and interactive CLI.
 
-BaseAgent is a convenience wrapper around openai-agents that:
-- Loads OpenAI configuration from environment variables and configures a default client.
-- Provides run/run_sync/run_streamed and a small interactive CLI (agent.cli()).
-- Useful when you want to combine dataset operations with LLM-driven workflows.
-
-### Example:
+Simple example:
 
 ```python
-from parquool import BaseAgent
-agent = BaseAgent(name='myagent')
+from parquool import Agent
+
+agent = Agent(name='myagent')
+# Synchronous run (blocking)
 res = agent.run_sync('Summarize the following data...')
 print(res)
-
-# Start a simple synchronous CLI
-agent.cli()
 ```
 
-## Environment variables
+Use Collection to link a knowledge collection and enable knowledge search:
 
-You can store configuration in a .env file. Common variables used by the project:
-- OPENAI_BASE_URL: optional base URL for an OpenAI-compatible service
-- OPENAI_API_KEY: API key for OpenAI
-- OPENAI_MODEL_NAME: default model name used by BaseAgent
-- NOTIFY_TASK_SENDER, NOTIFY_TASK_PASSWORD, NOTIFY_TASK_RECEIVER, NOTIFY_TASK_SMTP_SERVER, NOTIFY_TASK_SMTP_PORT, NOTIFY_TASK_CC: for notify_task
+```python
+from parquool import Collection
+
+collection = Collection()
+collection.load(["myfile.txt", "myfile.md"])
+... # more files can be loaded; this usually only needs to be done once
+agent = Agent(collection=collection)
+agent.run_streamed_sync("What's my plan for tomorrow?")
+```
+
+You can visualize the agent with Streamlit. Install streamlit first via pip. If you want to add a web search tool, set up a SERPAPI key by adding SERPAPI_KEY to your environment variables.
+
+Example Streamlit usage:
+
+```python
+import streamlit as st
+from parquool import Agent
+from openai.types.responses import ResponseTextDeltaEvent
+
+
+async def stream(prompt):
+    async for event in st.session_state.agent.stream(prompt):
+        # Print streaming delta if available
+        if event.type == "raw_response_event" and isinstance(
+            event.data, ResponseTextDeltaEvent
+        ):
+            yield event.data.delta
+        elif event.type == "run_item_stream_event":
+            if event.item.type == "tool_call_item":
+                yield f"{event.item.raw_item.name} - {event.item.raw_item.arguments}\n\n"
+            elif event.item.type == "tool_call_output_item":
+                yield event.item.output
+            else:
+                pass
+
+
+st.title("Test Agent")
+
+if not st.session_state.get("agent"):
+    st.session_state.agent = Agent(
+        tools=[Agent.google_search, Agent.read_url]
+    )
+
+st.session_state.messages = st.session_state.agent.get_conversation()
+
+for message in st.session_state.messages:
+    if message.get("role") == "user":
+        with st.chat_message("user"):
+            st.markdown(message["content"])
+    elif message.get("role") == "assistant":
+        with st.chat_message("assistant"):
+            st.markdown(message["content"][0]["text"])
+    elif message.get("type") == "function_call":
+        with st.chat_message("assistant"):
+            with st.expander(message["name"]):
+                st.code(message["arguments"])
+    elif message.get("type") == "function_call_output":
+        with st.chat_message("assistant"):
+            with st.expander("Expand to see the result"):
+                st.code(message["output"])
+
+if prompt := st.chat_input("What's up?"):
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    with st.chat_message("assistant"):
+        response = st.write_stream(stream(prompt))
+```
+
+## Environment Variables
+
+It is recommended to create a .env file in the project root for configuration:
+
+- LITELLM_BASE_URL: Base URL for an OpenAI-compatible service (optional)
+- LITELLM_API_KEY: OpenAI API key
+- LITELLM_MODEL_NAME: Default model name to use
+- NOTIFY_TASK_*: Configuration for the notify_task decorator (see above)
 
 ## Contributing
 
-Contributions are welcome. Please open issues or submit pull requests with clear descriptions and tests where applicable.
+Issues and pull requests are welcome. When submitting a PR, please include related unit tests and reproduction steps where applicable, especially for changes that touch parquet file replacement and data consistency.
 
 ## License
 
-See pyproject.toml — the project is licensed under the MIT License.
+This project is declared under the MIT License in pyproject.toml.
 
-## Author
+## Contact
 
-ppoak <ppoak@foxmail.com>
-Homepage: https://github.com/ppoak/parquool
+Author: ppoak <ppoak@foxmail.com>  
+Project homepage: https://github.com/ppoak/parquool
