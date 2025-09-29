@@ -532,7 +532,7 @@ class DuckParquet:
         if self._parquet_files_exist():
             self._create_or_replace_view()
 
-    # --- Private Helper Methods ---
+    # ----------------- Private Helper Methods -----------------
 
     @staticmethod
     def _is_identifier(name: str) -> bool:
@@ -622,14 +622,6 @@ class DuckParquet:
         sql = f"CREATE OR REPLACE VIEW {view_ident} AS SELECT * FROM parquet_scan('{self.scan_pattern}', HIVE_PARTITIONING=1)"
         self.con.execute(sql)
 
-    def _base_columns(self) -> List[str]:
-        """Get all base columns from current parquet duckdb view.
-
-        Returns:
-            List[str]: List of column names in the schema.
-        """
-        return self.list_columns()
-
     def _copy_select_to_dir(
         self,
         select_sql: str,
@@ -699,7 +691,7 @@ class DuckParquet:
             shutil.rmtree(old_dir)
         os.replace(new_dir, old_dir)
 
-    # ---- Upsert Internal Logic ----
+    # ----------------- Upsert Internal Logic -----------------
 
     def _upsert_no_exist(self, df: pd.DataFrame, partition_by: Optional[list]) -> None:
         """Upsert logic branch if no existing parquet files.
@@ -813,7 +805,7 @@ class DuckParquet:
                 shutil.rmtree(tmpdir, ignore_errors=True)
             self.refresh()
 
-    # --- Context/Resource Management ---
+    # ----------------- Context/Resource Management -----------------
 
     def close(self):
         """Close the DuckDB connection."""
@@ -840,7 +832,17 @@ class DuckParquet:
     def __repr__(self):
         return self.__str__()
 
-    # --- Public Query/Mutation Methods ---
+    # ----------------- Public Query/Mutation Methods -----------------
+
+    @property
+    def empty(self) -> bool:
+        """Return true if the duck parquet path is empty"""
+        return self._parquet_files_exist()
+
+    @property
+    def columns(self) -> List[str]:
+        """Get all base columns from current parquet duckdb view."""
+        return self.list_columns()
 
     def refresh(self):
         """Refreshes DuckDB view after manual file changes."""
@@ -1112,6 +1114,9 @@ class DuckParquet:
             keys (list): Primary key columns.
             partition_by (Optional[list]): Partition columns.
         """
+        if df.duplicated(subset=keys).any():
+            raise ValueError("DataFrame contains duplicate rows based on keys.")
+
         if not self._parquet_files_exist():
             self._upsert_no_exist(df, partition_by)
         else:
@@ -1135,7 +1140,7 @@ class DuckParquet:
         if os.path.isfile(self.dataset_path):
             pass
         view_ident = DuckParquet._quote_ident(self.view_name)
-        base_cols = self._base_columns()
+        base_cols = self.list_columns()
         bind_params = list(params or [])
         select_exprs = []
         for col in base_cols:
@@ -1930,7 +1935,9 @@ class Agent:
                 self.logger.warning("tools must be agents.Tool or callable instances")
 
         self.model = LitellmModel(
-            base_url=base_url or os.getenv("LITELLM_BASE_URL") or "https://api.openai.com/v1",
+            base_url=base_url
+            or os.getenv("LITELLM_BASE_URL")
+            or "https://api.openai.com/v1",
             api_key=api_key or os.getenv("LITELLM_API_KEY"),
             model=model_name or os.getenv("LITELLM_MODEL_NAME"),
         )
