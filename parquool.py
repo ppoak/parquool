@@ -514,10 +514,10 @@ class DuckParquet:
         Raises:
             ValueError: If the dataset_path is not a directory.
         """
-        self.dataset_path = os.path.abspath(dataset_path)
-        if not os.path.exists(self.dataset_path):
-            os.makedirs(self.dataset_path)
-        if not os.path.isdir(self.dataset_path):
+        self.dataset_path = Path(dataset_path)
+        if not self.dataset_path.exists():
+            self.dataset_path.mkdir(exist_ok=True, parents=True)
+        if not self.dataset_path.is_dir():
             raise ValueError("Only directory is valid in dataset_path param")
         self.view_name = name or self._default_view_name(self.dataset_path)
         config = {}
@@ -561,7 +561,7 @@ class DuckParquet:
         return '"' + name.replace('"', '""') + '"'
 
     @staticmethod
-    def _default_view_name(path: str) -> str:
+    def _default_view_name(path: Path) -> str:
         """Generate a default DuckDB view name from file/directory name.
 
         Args:
@@ -570,14 +570,13 @@ class DuckParquet:
         Returns:
             str: Default view name.
         """
-        base = os.path.basename(path.rstrip(os.sep))
-        name = os.path.splitext(base)[0] if base.endswith(".parquet") else base
+        name = Path(path).stem
         if not DuckParquet._is_identifier(name):
             name = "ds_" + re.sub(r"[^A-Za-z0-9_]+", "_", name)
         return name or "dataset"
 
     @staticmethod
-    def _infer_scan_pattern(path: str) -> str:
+    def _infer_scan_pattern(path: Path) -> str:
         """Infer DuckDB's parquet_scan path glob based on the directory path.
 
         Args:
@@ -586,8 +585,9 @@ class DuckParquet:
         Returns:
             str: Glob scan pattern.
         """
-        if os.path.isdir(path):
-            return os.path.join(path, "**/*.parquet")
+        path = Path(path)
+        if path.is_dir():
+            return str(path / "**/*.parquet")
         return path
 
     @staticmethod
@@ -600,8 +600,8 @@ class DuckParquet:
         Returns:
             str: Path to temp directory.
         """
-        tmpdir = os.path.join(target_dir, f"{prefix}{uuid.uuid4().hex[:8]}")
-        os.makedirs(tmpdir)
+        tmpdir = Path(target_dir) / f"{prefix}{uuid.uuid4().hex[:8]}"
+        tmpdir.mkdir(exist_ok=True, parents=True)
         return tmpdir
 
     def _parquet_files_exist(self) -> bool:
@@ -610,10 +610,8 @@ class DuckParquet:
         Returns:
             bool: True if any parquet exists, else False.
         """
-        for root, dirs, files in os.walk(self.dataset_path):
-            for fn in files:
-                if fn.endswith(".parquet"):
-                    return True
+        for _ in self.dataset_path.rglob("*.parquet"):
+            return True
         return False
 
     def _create_or_replace_view(self):
@@ -680,16 +678,18 @@ class DuckParquet:
         self.con.execute(sql)
         self.con.unregister(reg_name)
 
-    def _atomic_replace_dir(self, new_dir: str, old_dir: str):
+    def _atomic_replace_dir(self, new_dir: Union[Path, str], old_dir: Union[Path, str]):
         """Atomically replace a directory's contents.
 
         Args:
-            new_dir (str): Temporary directory with new data.
-            old_dir (str): Target directory to replace.
+            new_dir (Path or str): Temporary directory with new data.
+            old_dir (Path or str): Target directory to replace.
         """
-        if os.path.exists(old_dir):
-            shutil.rmtree(old_dir)
-        os.replace(new_dir, old_dir)
+        new_dir = Path(new_dir)
+        old_dir = Path(old_dir)
+        if old_dir.exists():
+            shutil.rmtree(str(old_dir))
+        new_dir.replace(old_dir)
 
     # ----------------- Upsert Internal Logic -----------------
 
@@ -700,7 +700,7 @@ class DuckParquet:
             df (pd.DataFrame): Raw DataFrame
             partition_by (Optional[list]): Partition columns
         """
-        tmpdir = self._local_tempdir(".")
+        tmpdir = self._local_tempdir(self.dataset_path.parent)
         try:
             self._copy_df_to_dir(
                 df,
@@ -709,7 +709,7 @@ class DuckParquet:
             )
             self._atomic_replace_dir(tmpdir, self.dataset_path)
         finally:
-            if os.path.exists(tmpdir):
+            if tmpdir.exists():
                 shutil.rmtree(tmpdir, ignore_errors=True)
         self.refresh()
 
@@ -723,7 +723,7 @@ class DuckParquet:
             keys (list): Primary key columns
             partition_by (Optional[list]): Partition columns
         """
-        tmpdir = self._local_tempdir(".")
+        tmpdir = self._local_tempdir(self.dataset_path.parent)
         base_cols = self.list_columns()
         all_cols = ", ".join(DuckParquet._quote_ident(c) for c in base_cols)
         key_expr = ", ".join(DuckParquet._quote_ident(k) for k in keys)
@@ -733,7 +733,7 @@ class DuckParquet:
 
         try:
             if not partition_by:
-                out_path = os.path.join(tmpdir, "data_0.parquet")
+                out_path = tmpdir / "data_0.parquet"
                 sql = f"""
                     COPY (
                         SELECT {all_cols} FROM (
@@ -747,10 +747,10 @@ class DuckParquet:
                     ) TO '{out_path}' (FORMAT 'parquet', COMPRESSION 'zstd')
                 """
                 self.con.execute(sql)
-                dst = os.path.join(self.dataset_path, "data_0.parquet")
-                if os.path.exists(dst):
-                    os.remove(dst)
-                shutil.move(out_path, dst)
+                dst = self.dataset_path / "data_0.parquet"
+                if dst.exists():
+                    dst.unlink()
+                shutil.move(str(out_path), str(dst))
             else:
                 parts_tbl = f"parts_{uuid.uuid4().hex[:6]}"
                 affected = df[partition_by].drop_duplicates()
@@ -782,16 +782,18 @@ class DuckParquet:
                 """
                 self.con.execute(sql)
 
-                for subdir in next(os.walk(tmpdir))[1]:
-                    src = os.path.join(tmpdir, subdir)
-                    dst = os.path.join(self.dataset_path, subdir)
-                    if os.path.exists(dst):
-                        if os.path.isdir(dst):
-                            shutil.rmtree(dst)
+                # move each partition subdir from tmpdir -> dataset_path using pathlib
+                subdirs = [d.name for d in tmpdir.iterdir() if d.is_dir()]
+                for subdir in subdirs:
+                    src = tmpdir / subdir
+                    dst = self.dataset_path / subdir
+                    if dst.exists():
+                        if dst.is_dir():
+                            shutil.rmtree(str(dst))
                         else:
-                            os.remove(dst)
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    shutil.move(src, dst)
+                            dst.unlink()
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src), str(dst))
         finally:
             try:
                 self.con.unregister(temp_name)
@@ -801,8 +803,8 @@ class DuckParquet:
                 self.con.unregister(parts_tbl)  # type: ignore
             except Exception:
                 pass
-            if os.path.exists(tmpdir):
-                shutil.rmtree(tmpdir, ignore_errors=True)
+            if tmpdir.exists():
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
             self.refresh()
 
     # ----------------- Context/Resource Management -----------------
@@ -1137,7 +1139,7 @@ class DuckParquet:
             partition_by (Optional[str]): Partition column.
             params (Optional[Sequence[Any]]): Bind parameters for WHERE.
         """
-        if os.path.isfile(self.dataset_path):
+        if self.dataset_path.is_file():
             pass
         view_ident = DuckParquet._quote_ident(self.view_name)
         base_cols = self.list_columns()
@@ -1163,7 +1165,7 @@ class DuckParquet:
                 expr = f"{col_ident}"
             select_exprs.append(expr)
         select_sql = f"SELECT {', '.join(select_exprs)} FROM {view_ident}"
-        tmpdir = self._local_tempdir(".")
+        tmpdir = self._local_tempdir(self.dataset_path.parent)
         try:
             self._copy_select_to_dir(
                 select_sql,
@@ -1172,8 +1174,8 @@ class DuckParquet:
             )
             self._atomic_replace_dir(tmpdir, self.dataset_path)
         finally:
-            if os.path.exists(tmpdir):
-                shutil.rmtree(tmpdir, ignore_errors=True)
+            if tmpdir.exists():
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
         self.refresh()
 
     def delete(
@@ -1192,7 +1194,7 @@ class DuckParquet:
         view_ident = DuckParquet._quote_ident(self.view_name)
         bind_params = list(params or [])
         select_sql = f"SELECT * FROM {view_ident} WHERE NOT ({where})"
-        tmpdir = self._local_tempdir(".")
+        tmpdir = self._local_tempdir(self.dataset_path.parent)
         try:
             self._copy_select_to_dir(
                 select_sql,
@@ -1202,8 +1204,8 @@ class DuckParquet:
             )
             self._atomic_replace_dir(tmpdir, self.dataset_path)
         finally:
-            if os.path.exists(tmpdir):
-                shutil.rmtree(tmpdir, ignore_errors=True)
+            if tmpdir.exists():
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
         self.refresh()
 
 
