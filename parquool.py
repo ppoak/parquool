@@ -341,9 +341,20 @@ def notify_task(
                 # Attach images and files as needed
                 for i, file_path in enumerate(file_paths):
                     file = Path(file_path)
-                    if file.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif"}:
-                        with file.open("rb") as img:
-                            img_data = img.read()
+                    if file.suffix.lower() in {
+                        ".png",
+                        ".jpg",
+                        ".jpeg",
+                        ".gif",
+                        ".xlsx",
+                        ".docx",
+                        "pptx",
+                        ".xls",
+                        ".doc",
+                        ".ppt",
+                    }:
+                        with file.open("rb") as bin:
+                            img_data = bin.read()
                             # Create a unique content ID
                             cid = f"image{i}"
                             image_mime = MIMEImage(img_data)
