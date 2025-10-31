@@ -1,3 +1,5 @@
+import inspect
+import textwrap
 import asyncio
 import json
 import os
@@ -12,6 +14,8 @@ from copy import deepcopy
 from functools import wraps
 from pathlib import Path
 from typing import (
+    get_origin,
+    get_args,
     Any,
     Dict,
     List,
@@ -359,7 +363,10 @@ def notify_task(
                         ctype, _ = mimetypes.guess_type(file.name)
                         if ctype and ctype.startswith("text/"):
                             part = MIMEText(file.read_text("utf-8"), "plain", "utf-8")
-                            part.add_header("Content-Disposition", f'attachment; filename="{file.name}"')
+                            part.add_header(
+                                "Content-Disposition",
+                                f'attachment; filename="{file.name}"',
+                            )
                             content.attach(part)
                         else:
                             ctype = ctype or "application/octet-stream"
@@ -367,8 +374,13 @@ def notify_task(
                             part = MIMEBase(main, sub)
                             part.set_payload(file.read_bytes())
                             encoders.encode_base64(part)
-                            part.add_header("Content-Disposition", f'attachment; filename="{file.name}"')
-                            part.add_header("Content-Type", f'{ctype}; name="{file.name}"')
+                            part.add_header(
+                                "Content-Disposition",
+                                f'attachment; filename="{file.name}"',
+                            )
+                            part.add_header(
+                                "Content-Type", f'{ctype}; name="{file.name}"'
+                            )
                             content.attach(part)
 
                 # Update the HTML part with embedded image references
@@ -446,6 +458,1210 @@ def proxy_request(
     response.raise_for_status()
     return response
 
+def generate_usage(
+    target: object,
+    output_path: Optional[str] = None,
+    *,
+    # Class-scope controls
+    include_private: bool = False,
+    include_inherited: bool = False,
+    include_properties: bool = True,
+    include_methods: bool = True,
+    method_kinds: tuple[str, ...] = ("instance", "class", "static"),
+    method_include: Optional[list[str]] = None,
+    method_exclude: Optional[list[str]] = None,
+    attribute_include: Optional[list[str]] = None,
+    attribute_exclude: Optional[list[str]] = None,
+    # Rendering controls
+    sort_methods: Literal["name", "kind", "none"] = "name",
+    render_tables: bool = True,
+    include_signature: bool = True,
+    include_sections: Optional[
+        Literal[
+            "summary",
+            "description",
+            "attributes",
+            "methods",
+            "parameters",
+            "returns",
+            "raises",
+            "examples",
+        ]
+    ] = None,
+    heading_level: int = 1,
+) -> str:
+    """Generate a GitHub-friendly Markdown usage document for a Python class or function.
+
+    This function inspects a target object (class or function), parses its Google-style
+    docstring(s) and merges them with Python type annotations to produce a comprehensive
+    Markdown document suitable for GitHub/README usage. If output_path is provided, the
+    Markdown will also be saved to that file path.
+
+    Args:
+        target: A class object or a function/callable to document.
+        output_path: Optional file path to save the Markdown document. If None, the
+            document will not be written to disk.
+
+        include_private: (Class only) Whether to include members whose names start with "_".
+        include_inherited: (Class only) Whether to include methods inherited from base classes.
+        include_properties: (Class only) Whether to include @property attributes as Attributes.
+        include_methods: (Class only) Whether to include methods.
+        method_kinds: (Class only) Which method kinds to include. Any of ("instance","class","static").
+        method_include: (Class only) Optional whitelist of method names to include.
+        method_exclude: (Class only) Optional blacklist of method names to exclude.
+        attribute_include: (Class only) Optional whitelist of attribute names to include.
+        attribute_exclude: (Class only) Optional blacklist of attribute names to exclude.
+
+        sort_methods: (Class only) How to sort methods in output. One of "name", "kind", "none".
+        render_tables: If True, render Parameters/Attributes as tables; otherwise as bullet lists.
+        include_signature: Whether to include the Python function/method signature code block.
+        include_sections: Optional subset of sections to render. Allowed values:
+            ["summary","description","attributes","methods","parameters","returns","raises","examples"].
+            If None, all sections are included.
+        heading_level: Base Markdown heading level for the title (>=1).
+
+    Returns:
+        The generated Markdown document as a string.
+
+    Examples:
+        >>> def greet(name: str) -> str:
+        ...     \"\"\"Say hello.
+        ...
+        ...     Args:
+        ...         name (str): Person's name.
+        ...
+        ...     Returns:
+        ...         str: Greeting message.
+        ...     \"\"\"
+        ...     return f"Hello, {name}!"
+        ...
+        >>> md = generate_usage_markdown(greet, output_path=None)
+        >>> print(md)
+    """
+    # Validate/normalize rendering controls
+    allowed_sections = {"summary","description","attributes","methods","parameters","returns","raises","examples"}
+    sec = set(include_sections) if include_sections else allowed_sections
+    sec = sec.intersection(allowed_sections)
+    if sort_methods not in ("name", "kind", "none"):
+        sort_methods = "name"
+    base_h = max(1, int(heading_level))
+    h1 = "#" * base_h
+    h2 = "#" * (base_h + 1)
+    h3 = "#" * (base_h + 2)
+
+    # Detect kind (class or function)
+    is_class = inspect.isclass(target)
+    is_callable = callable(target)
+    if not is_class and not is_callable:
+        raise TypeError("target must be a class or a function/callable")
+
+    # Helper-free inline blocks:
+    # 1) Docstring parsing (Google style). We will reuse this logic by copying the block for each docstring we need.
+    # 2) Type annotation to readable string conversion. We will inline this logic wherever we need to convert an annotation.
+
+    # Common metadata
+    obj_module = getattr(target, "__module__", "")
+    obj_qualname = getattr(target, "__qualname__", getattr(target, "__name__", str(target)))
+    obj_name = getattr(target, "__name__", str(target))
+
+    # Build output lines
+    lines = []
+
+    if is_class:
+        # ----- Parse class docstring -----
+        raw_doc = inspect.getdoc(target)
+        cls_summary = ""
+        cls_description = ""
+        cls_attributes = []
+        cls_examples = []
+        # Parse Google-style docstring for class
+        if raw_doc:
+            d = textwrap.dedent(raw_doc).strip("\n")
+            L = d.splitlines()
+            n = len(L)
+            i = 0
+            summary_lines = []
+            while i < n and L[i].strip():
+                summary_lines.append(L[i].strip())
+                i += 1
+            cls_summary = " ".join(summary_lines).strip()
+            while i < n and not L[i].strip():
+                i += 1
+            section = None
+            section_buffer = {
+                "description": [],
+                "Args": [],
+                "Returns": [],
+                "Raises": [],
+                "Attributes": [],
+                "Examples": [],
+            }
+            headers = set(section_buffer.keys())
+            while i < n:
+                line = L[i]
+                s = line.strip()
+                if s.endswith(":"):
+                    h = s[:-1]
+                    if h in headers:
+                        section = h
+                        i += 1
+                        continue
+                if section:
+                    section_buffer[section].append(line)
+                else:
+                    section_buffer["description"].append(line)
+                i += 1
+            cls_description = "\n".join([x.rstrip() for x in section_buffer["description"]]).strip()
+
+            # Parse Attributes items
+            items = []
+            current = None
+            for b in section_buffer["Attributes"]:
+                if not b.strip():
+                    continue
+                m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(\(([^)]*)\))?\s*:\s*(.*)$", b)
+                if m:
+                    name_i = m.group(1)
+                    type_i = m.group(3)
+                    desc_i = m.group(4).strip()
+                    current = {"name": name_i, "type": (type_i.strip() if type_i else None), "desc": desc_i}
+                    items.append(current)
+                else:
+                    if current:
+                        current["desc"] += " " + b.strip()
+            cls_attributes = items
+
+            # Examples block
+            if section_buffer["Examples"]:
+                ex_blocks = []
+                block = []
+                for l in section_buffer["Examples"]:
+                    if l.strip():
+                        block.append(l.rstrip())
+                    else:
+                        if block:
+                            ex_blocks.append("\n".join(block))
+                            block = []
+                if block:
+                    ex_blocks.append("\n".join(block))
+                cls_examples = ex_blocks
+
+        # ----- Collect attributes (merge @property) -----
+        attr_map = {}
+        for a in cls_attributes:
+            attr_map[a["name"]] = {"name": a["name"], "type": a.get("type"), "desc": a.get("desc", "")}
+
+        if include_properties:
+            for name, _ in inspect.getmembers(target):
+                if name.startswith("_") and not include_private:
+                    continue
+                try:
+                    stat = inspect.getattr_static(target, name)
+                except Exception:
+                    stat = None
+                if isinstance(stat, property):
+                    p_raw = inspect.getdoc(stat.fget)
+                    p_summary = ""
+                    p_description = ""
+                    if p_raw:
+                        pd = textwrap.dedent(p_raw).strip("\n")
+                        PL = pd.splitlines()
+                        pn = len(PL)
+                        pi = 0
+                        p_sum_lines = []
+                        while pi < pn and PL[pi].strip():
+                            p_sum_lines.append(PL[pi].strip())
+                            pi += 1
+                        p_summary = " ".join(p_sum_lines).strip()
+                        while pi < pn and not PL[pi].strip():
+                            pi += 1
+                        p_section = None
+                        p_buffer = {"description": [], "Args": [], "Returns": [], "Raises": [], "Attributes": [], "Examples": []}
+                        p_headers = set(p_buffer.keys())
+                        while pi < pn:
+                            pline = PL[pi]
+                            ps = pline.strip()
+                            if ps.endswith(":"):
+                                ph = ps[:-1]
+                                if ph in p_headers:
+                                    p_section = ph
+                                    pi += 1
+                                    continue
+                            if p_section:
+                                p_buffer[p_section].append(pline)
+                            else:
+                                p_buffer["description"].append(pline)
+                            pi += 1
+                        p_description = "\n".join([x.rstrip() for x in p_buffer["description"]]).strip()
+                    # property type from return annotation
+                    try:
+                        pann = stat.fget.__annotations__.get("return", inspect._empty)
+                    except Exception:
+                        pann = inspect._empty
+                    # Inline: annotation -> string
+                    if pann is inspect._empty:
+                        ptype_str = "any"
+                    else:
+                        porigin = get_origin(pann)
+                        pargs = get_args(pann)
+                        if porigin is Union:
+                            non_none = [a for a in pargs if a is not type(None)]
+                            if len(non_none) == 1 and len(pargs) == 2 and type(None) in pargs:
+                                inner = non_none[0]
+                                try:
+                                    ptype_str = f"Optional[{inner.__name__}]"
+                                except Exception:
+                                    ptype_str = f"Optional[{str(inner)}]"
+                            else:
+                                parts = []
+                                for a in pargs:
+                                    try:
+                                        parts.append(a.__name__)
+                                    except Exception:
+                                        parts.append(str(a))
+                                ptype_str = " | ".join(parts)
+                        elif porigin in (list,):
+                            try:
+                                inner = pargs[0] if pargs else None
+                                if inner is None:
+                                    ptype_str = "List[any]"
+                                else:
+                                    try:
+                                        ptype_str = f"List[{inner.__name__}]"
+                                    except Exception:
+                                        ptype_str = f"List[{str(inner)}]"
+                            except Exception:
+                                ptype_str = "List[any]"
+                        elif porigin in (dict,):
+                            try:
+                                k = pargs[0] if pargs else None
+                                v = pargs[1] if len(pargs) > 1 else None
+                                k_str = getattr(k, "__name__", str(k)) if k else "any"
+                                v_str = getattr(v, "__name__", str(v)) if v else "any"
+                                ptype_str = f"Dict[{k_str}, {v_str}]"
+                            except Exception:
+                                ptype_str = "Dict[any, any]"
+                        elif porigin in (tuple,):
+                            try:
+                                inner = ", ".join(getattr(a, "__name__", str(a)) for a in pargs) if pargs else ""
+                                ptype_str = f"Tuple[{inner}]"
+                            except Exception:
+                                ptype_str = "Tuple"
+                        else:
+                            try:
+                                ptype_str = pann.__name__
+                            except Exception:
+                                ptype_str = str(pann)
+                    entry = {
+                        "name": name,
+                        "type": None if ptype_str == "any" else ptype_str,
+                        "desc": p_summary or p_description or attr_map.get(name, {}).get("desc", ""),
+                    }
+                    if name in attr_map:
+                        if not attr_map[name].get("type") and entry["type"]:
+                            attr_map[name]["type"] = entry["type"]
+                        if not attr_map[name].get("desc") and entry["desc"]:
+                            attr_map[name]["desc"] = entry["desc"]
+                    else:
+                        attr_map[name] = entry
+
+        attrs = list(attr_map.values())
+        if attribute_include:
+            inc = set(attribute_include)
+            attrs = [a for a in attrs if a["name"] in inc]
+        if attribute_exclude:
+            exc = set(attribute_exclude)
+            attrs = [a for a in attrs if a["name"] not in exc]
+
+        # ----- Collect methods -----
+        methods = []
+        if include_methods:
+            for name, member in inspect.getmembers(target):
+                if name.startswith("_") and not include_private:
+                    continue
+                if not callable(member):
+                    continue
+                try:
+                    stat = inspect.getattr_static(target, name)
+                except Exception:
+                    stat = None
+                if isinstance(stat, staticmethod):
+                    kind = "static"
+                    func = stat.__func__
+                elif isinstance(stat, classmethod):
+                    kind = "class"
+                    func = stat.__func__
+                elif inspect.isfunction(stat) or inspect.ismethod(stat) or inspect.isroutine(stat):
+                    kind = "instance"
+                    func = member if inspect.isfunction(member) else getattr(target, name)
+                else:
+                    continue
+
+                if kind not in method_kinds:
+                    continue
+                if not include_inherited:
+                    qn = getattr(func, "__qualname__", "")
+                    base = qn.split(".")[0] if qn else ""
+                    if base and base != target.__name__:
+                        continue
+                if method_include and name not in set(method_include):
+                    continue
+                if method_exclude and name in set(method_exclude):
+                    continue
+
+                sig = inspect.signature(func)
+                # Parse method docstring
+                m_raw = inspect.getdoc(func)
+                m_summary = ""
+                m_description = ""
+                m_args = []
+                m_returns = None
+                m_raises = []
+                m_examples = []
+                if m_raw:
+                    md = textwrap.dedent(m_raw).strip("\n")
+                    ML = md.splitlines()
+                    mn = len(ML)
+                    mi = 0
+                    m_sum_lines = []
+                    while mi < mn and ML[mi].strip():
+                        m_sum_lines.append(ML[mi].strip())
+                        mi += 1
+                    m_summary = " ".join(m_sum_lines).strip()
+                    while mi < mn and not ML[mi].strip():
+                        mi += 1
+                    m_section = None
+                    m_buffer = {"description": [], "Args": [], "Returns": [], "Raises": [], "Attributes": [], "Examples": []}
+                    m_headers = set(m_buffer.keys())
+                    while mi < mn:
+                        ml = ML[mi]
+                        ms = ml.strip()
+                        if ms.endswith(":"):
+                            mh = ms[:-1]
+                            if mh in m_headers:
+                                m_section = mh
+                                mi += 1
+                                continue
+                        if m_section:
+                            m_buffer[m_section].append(ml)
+                        else:
+                            m_buffer["description"].append(ml)
+                        mi += 1
+                    m_description = "\n".join([x.rstrip() for x in m_buffer["description"]]).strip()
+                    # Args
+                    current = None
+                    for b in m_buffer["Args"]:
+                        if not b.strip():
+                            continue
+                        mm = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(\(([^)]*)\))?\s*:\s*(.*)$", b)
+                        if mm:
+                            an = mm.group(1)
+                            at = mm.group(3)
+                            ad = mm.group(4).strip()
+                            current = {"name": an, "type": (at.strip() if at else None), "desc": ad}
+                            m_args.append(current)
+                        else:
+                            if current:
+                                current["desc"] += " " + b.strip()
+                    # Returns
+                    ret_lines = [l for l in m_buffer["Returns"] if l.strip()]
+                    if ret_lines:
+                        mmr = re.match(r"^\s*([^:]+?)\s*:\s*(.*)$", ret_lines[0].strip())
+                        if mmr:
+                            rt = mmr.group(1).strip()
+                            rd = mmr.group(2).strip()
+                            extra = " ".join(l.strip() for l in ret_lines[1:]).strip()
+                            if extra:
+                                rd = (rd + " " + extra).strip()
+                            m_returns = {"type": rt, "desc": rd}
+                        else:
+                            rd = " ".join(l.strip() for l in ret_lines).strip()
+                            m_returns = {"type": None, "desc": rd}
+                    # Raises
+                    current = None
+                    for b in m_buffer["Raises"]:
+                        if not b.strip():
+                            continue
+                        rm = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_.]*)\s*:\s*(.*)$", b)
+                        if rm:
+                            et = rm.group(1)
+                            ed = rm.group(2).strip()
+                            current = {"type": et, "desc": ed}
+                            m_raises.append(current)
+                        else:
+                            if current:
+                                current["desc"] += " " + b.strip()
+                    # Examples
+                    if m_buffer["Examples"]:
+                        ex_blocks = []
+                        block = []
+                        for l in m_buffer["Examples"]:
+                            if l.strip():
+                                block.append(l.rstrip())
+                            else:
+                                if block:
+                                    ex_blocks.append("\n".join(block))
+                                    block = []
+                        if block:
+                            ex_blocks.append("\n".join(block))
+                        m_examples = ex_blocks
+
+                # Build parameters with merged doc + annotations
+                args_doc_map = {a["name"]: a for a in m_args}
+                params = []
+                for pname, p in sig.parameters.items():
+                    if pname == "self" and kind == "instance":
+                        continue
+                    if pname == "cls" and kind == "class":
+                        continue
+                    pann = p.annotation
+                    # Inline: ann -> str
+                    if pann is inspect._empty:
+                        ptype_str = "any"
+                    else:
+                        porigin = get_origin(pann)
+                        pargs = get_args(pann)
+                        if porigin is Union:
+                            non_none = [a for a in pargs if a is not type(None)]
+                            if len(non_none) == 1 and len(pargs) == 2 and type(None) in pargs:
+                                inner = non_none[0]
+                                try:
+                                    ptype_str = f"Optional[{inner.__name__}]"
+                                except Exception:
+                                    ptype_str = f"Optional[{str(inner)}]"
+                            else:
+                                parts = []
+                                for a in pargs:
+                                    try:
+                                        parts.append(a.__name__)
+                                    except Exception:
+                                        parts.append(str(a))
+                                ptype_str = " | ".join(parts)
+                        elif porigin in (list,):
+                            try:
+                                inner = pargs[0] if pargs else None
+                                if inner is None:
+                                    ptype_str = "List[any]"
+                                else:
+                                    try:
+                                        ptype_str = f"List[{inner.__name__}]"
+                                    except Exception:
+                                        ptype_str = f"List[{str(inner)}]"
+                            except Exception:
+                                ptype_str = "List[any]"
+                        elif porigin in (dict,):
+                            try:
+                                k = pargs[0] if pargs else None
+                                v = pargs[1] if len(pargs) > 1 else None
+                                k_str = getattr(k, "__name__", str(k)) if k else "any"
+                                v_str = getattr(v, "__name__", str(v)) if v else "any"
+                                ptype_str = f"Dict[{k_str}, {v_str}]"
+                            except Exception:
+                                ptype_str = "Dict[any, any]"
+                        elif porigin in (tuple,):
+                            try:
+                                inner = ", ".join(getattr(a, "__name__", str(a)) for a in pargs) if pargs else ""
+                                ptype_str = f"Tuple[{inner}]"
+                            except Exception:
+                                ptype_str = "Tuple"
+                        else:
+                            try:
+                                ptype_str = pann.__name__
+                            except Exception:
+                                ptype_str = str(pann)
+                    default = None if p.default is inspect._empty else p.default
+                    required = p.default is inspect._empty and p.kind in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    )
+                    doc_entry = args_doc_map.get(pname, {})
+                    params.append({
+                        "name": pname,
+                        "type": None if ptype_str == "any" else ptype_str,
+                        "default": default,
+                        "required": required,
+                        "desc": doc_entry.get("desc", ""),
+                    })
+
+                # Returns merge
+                ret_ann = sig.return_annotation
+                if ret_ann is inspect._empty:
+                    ret_ann_str = "any"
+                else:
+                    ro = get_origin(ret_ann)
+                    ra = get_args(ret_ann)
+                    if ro is Union:
+                        non_none = [a for a in ra if a is not type(None)]
+                        if len(non_none) == 1 and len(ra) == 2 and type(None) in ra:
+                            inner = non_none[0]
+                            try:
+                                ret_ann_str = f"Optional[{inner.__name__}]"
+                            except Exception:
+                                ret_ann_str = f"Optional[{str(inner)}]"
+                        else:
+                            parts = []
+                            for a in ra:
+                                try:
+                                    parts.append(a.__name__)
+                                except Exception:
+                                    parts.append(str(a))
+                            ret_ann_str = " | ".join(parts)
+                    elif ro in (list,):
+                        try:
+                            inner = ra[0] if ra else None
+                            if inner is None:
+                                ret_ann_str = "List[any]"
+                            else:
+                                try:
+                                    ret_ann_str = f"List[{inner.__name__}]"
+                                except Exception:
+                                    ret_ann_str = f"List[{str(inner)}]"
+                        except Exception:
+                            ret_ann_str = "List[any]"
+                    elif ro in (dict,):
+                        try:
+                            k = ra[0] if ra else None
+                            v = ra[1] if len(ra) > 1 else None
+                            k_str = getattr(k, "__name__", str(k)) if k else "any"
+                            v_str = getattr(v, "__name__", str(v)) if v else "any"
+                            ret_ann_str = f"Dict[{k_str}, {v_str}]"
+                        except Exception:
+                            ret_ann_str = "Dict[any, any]"
+                    elif ro in (tuple,):
+                        try:
+                            inner = ", ".join(getattr(a, "__name__", str(a)) for a in ra) if ra else ""
+                            ret_ann_str = f"Tuple[{inner}]"
+                        except Exception:
+                            ret_ann_str = "Tuple"
+                    else:
+                        try:
+                            ret_ann_str = ret_ann.__name__
+                        except Exception:
+                            ret_ann_str = str(ret_ann)
+                if not m_returns:
+                    m_returns = {"type": None if ret_ann_str == "any" else ret_ann_str, "desc": ""}
+                else:
+                    if m_returns.get("type") is None and ret_ann_str != "any":
+                        m_returns["type"] = ret_ann_str
+
+                methods.append({
+                    "name": name,
+                    "kind": kind,
+                    "async": inspect.iscoroutinefunction(func),
+                    "signature": str(sig),
+                    "summary": m_summary,
+                    "description": m_description,
+                    "parameters": params,
+                    "returns": m_returns,
+                    "raises": m_raises,
+                    "examples": m_examples,
+                })
+
+        # Sort methods
+        if sort_methods == "name":
+            methods.sort(key=lambda m: m["name"])
+        elif sort_methods == "kind":
+            order = {"instance": 0, "class": 1, "static": 2}
+            methods.sort(key=lambda m: (order.get(m["kind"], 99), m["name"]))
+        # else keep insertion order
+
+        # ----- Render class Markdown -----
+        lines.append(f"{h1} Class `{obj_name}`")
+        lines.append("")
+        lines.append(f"- Module: `{obj_module}`")
+        lines.append(f"- Qualname: `{obj_qualname}`")
+        lines.append("")
+
+        if "summary" in sec and cls_summary:
+            lines.append(f"{h2} Summary")
+            lines.append(cls_summary)
+            lines.append("")
+        if "description" in sec and cls_description:
+            lines.append(f"{h2} Description")
+            lines.append(cls_description)
+            lines.append("")
+
+        if "attributes" in sec and attrs:
+            lines.append(f"{h2} Attributes")
+            lines.append("")
+            if render_tables:
+                lines.append("| Name | Type | Description |")
+                lines.append("| ---- | ---- | ----------- |")
+                for a in attrs:
+                    typ = a.get("type") or ""
+                    desc = a.get("desc") or ""
+                    lines.append(f"| `{a['name']}` | `{typ}` | {desc} |")
+            else:
+                for a in attrs:
+                    typ = f" ({a.get('type')})" if a.get("type") else ""
+                    desc = f": {a.get('desc')}" if a.get("desc") else ""
+                    lines.append(f"- `{a['name']}`{typ}{desc}")
+            lines.append("")
+
+        if "methods" in sec and methods:
+            lines.append(f"{h2} Methods")
+            lines.append("")
+            for m in methods:
+                lines.append(f"{h3} `{m['name']}`")
+                lines.append("")
+                lines.append(f"- Kind: `{m['kind']}`")
+                lines.append(f"- Async: `{'true' if m['async'] else 'false'}`")
+                if include_signature:
+                    lines.append("- Signature:")
+                    lines.append("")
+                    lines.append("```python")
+                    lines.append(f"def {m['name']}{m['signature']}")
+                    lines.append("```")
+                    lines.append("")
+                if m["summary"]:
+                    lines.append("**Summary**")
+                    lines.append("")
+                    lines.append(m["summary"])
+                    lines.append("")
+                if m["description"]:
+                    lines.append("**Description**")
+                    lines.append("")
+                    lines.append(m["description"])
+                    lines.append("")
+                if "parameters" in sec and m["parameters"]:
+                    if render_tables:
+                        lines.append("**Parameters**")
+                        lines.append("")
+                        lines.append("| Name | Type | Required | Default | Description |")
+                        lines.append("| ---- | ---- | -------- | ------- | ----------- |")
+                        for p in m["parameters"]:
+                            typ = p["type"] or "any"
+                            req = "yes" if p["required"] else "no"
+                            default = "" if p["default"] is None else f"`{repr(p['default'])}`"
+                            desc = p["desc"] or ""
+                            lines.append(f"| `{p['name']}` | `{typ}` | {req} | {default} | {desc} |")
+                        lines.append("")
+                    else:
+                        lines.append("**Parameters**")
+                        for p in m["parameters"]:
+                            typ = p["type"] or "any"
+                            req = "required" if p["required"] else "optional"
+                            default = "" if p["default"] is None else f" (default={repr(p['default'])})"
+                            desc = f" - {p['desc']}" if p["desc"] else ""
+                            lines.append(f"- `{p['name']}`: {typ}, {req}{default}{desc}")
+                        lines.append("")
+                if "returns" in sec and m["returns"]:
+                    rtyp = m["returns"].get("type") or "any"
+                    rdesc = m["returns"].get("desc") or ""
+                    lines.append("**Returns**")
+                    lines.append("")
+                    lines.append(f"- Type: `{rtyp}`")
+                    if rdesc:
+                        lines.append(f"- Description: {rdesc}")
+                    lines.append("")
+                if "raises" in sec and m["raises"]:
+                    if m["raises"]:
+                        lines.append("**Raises**")
+                        lines.append("")
+                        for r in m["raises"]:
+                            lines.append(f"- `{r['type']}`: {r['desc']}")
+                        lines.append("")
+                if "examples" in sec and m["examples"]:
+                    if m["examples"]:
+                        lines.append("**Examples**")
+                        lines.append("")
+                        for ex in m["examples"]:
+                            lines.append("```python")
+                            lines.append(textwrap.dedent(ex).strip("\n"))
+                            lines.append("```")
+                            lines.append("")
+            lines.append("")
+
+    else:
+        # ----- Function case -----
+        func = target
+        sig = inspect.signature(func)
+        # Parse function docstring
+        f_raw = inspect.getdoc(func)
+        f_summary = ""
+        f_description = ""
+        f_args = []
+        f_returns = None
+        f_raises = []
+        f_examples = []
+        if f_raw:
+            fd = textwrap.dedent(f_raw).strip("\n")
+            FL = fd.splitlines()
+            fn = len(FL)
+            fi = 0
+            f_sum_lines = []
+            while fi < fn and FL[fi].strip():
+                f_sum_lines.append(FL[fi].strip())
+                fi += 1
+            f_summary = " ".join(f_sum_lines).strip()
+            while fi < fn and not FL[fi].strip():
+                fi += 1
+            f_section = None
+            f_buffer = {"description": [], "Args": [], "Returns": [], "Raises": [], "Attributes": [], "Examples": []}
+            f_headers = set(f_buffer.keys())
+            while fi < fn:
+                fl = FL[fi]
+                fs = fl.strip()
+                if fs.endswith(":"):
+                    fh = fs[:-1]
+                    if fh in f_headers:
+                        f_section = fh
+                        fi += 1
+                        continue
+                if f_section:
+                    f_buffer[f_section].append(fl)
+                else:
+                    f_buffer["description"].append(fl)
+                fi += 1
+            f_description = "\n".join([x.rstrip() for x in f_buffer["description"]]).strip()
+            # Args
+            current = None
+            for b in f_buffer["Args"]:
+                if not b.strip():
+                    continue
+                mm = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(\(([^)]*)\))?\s*:\s*(.*)$", b)
+                if mm:
+                    an = mm.group(1)
+                    at = mm.group(3)
+                    ad = mm.group(4).strip()
+                    current = {"name": an, "type": (at.strip() if at else None), "desc": ad}
+                    f_args.append(current)
+                else:
+                    if current:
+                        current["desc"] += " " + b.strip()
+            # Returns
+            ret_lines = [l for l in f_buffer["Returns"] if l.strip()]
+            if ret_lines:
+                mmr = re.match(r"^\s*([^:]+?)\s*:\s*(.*)$", ret_lines[0].strip())
+                if mmr:
+                    rt = mmr.group(1).strip()
+                    rd = mmr.group(2).strip()
+                    extra = " ".join(l.strip() for l in ret_lines[1:]).strip()
+                    if extra:
+                        rd = (rd + " " + extra).strip()
+                    f_returns = {"type": rt, "desc": rd}
+                else:
+                    rd = " ".join(l.strip() for l in ret_lines).strip()
+                    f_returns = {"type": None, "desc": rd}
+            # Raises
+            current = None
+            for b in f_buffer["Raises"]:
+                if not b.strip():
+                    continue
+                rm = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_.]*)\s*:\s*(.*)$", b)
+                if rm:
+                    et = rm.group(1)
+                    ed = rm.group(2).strip()
+                    current = {"type": et, "desc": ed}
+                    f_raises.append(current)
+                else:
+                    if current:
+                        current["desc"] += " " + b.strip()
+            # Examples
+            if f_buffer["Examples"]:
+                ex_blocks = []
+                block = []
+                for l in f_buffer["Examples"]:
+                    if l.strip():
+                        block.append(l.rstrip())
+                    else:
+                        if block:
+                            ex_blocks.append("\n".join(block))
+                            block = []
+                if block:
+                    ex_blocks.append("\n".join(block))
+                f_examples = ex_blocks
+
+        # Build parameters list (merge annotation + doc)
+        args_doc_map = {a["name"]: a for a in f_args}
+        f_params = []
+        for pname, p in sig.parameters.items():
+            pann = p.annotation
+            if pann is inspect._empty:
+                ptype_str = "any"
+            else:
+                porigin = get_origin(pann)
+                pargs = get_args(pann)
+                if porigin is Union:
+                    non_none = [a for a in pargs if a is not type(None)]
+                    if len(non_none) == 1 and len(pargs) == 2 and type(None) in pargs:
+                        inner = non_none[0]
+                        try:
+                            ptype_str = f"Optional[{inner.__name__}]"
+                        except Exception:
+                            ptype_str = f"Optional[{str(inner)}]"
+                    else:
+                        parts = []
+                        for a in pargs:
+                            try:
+                                parts.append(a.__name__)
+                            except Exception:
+                                parts.append(str(a))
+                        ptype_str = " | ".join(parts)
+                elif porigin in (list,):
+                    try:
+                        inner = pargs[0] if pargs else None
+                        if inner is None:
+                            ptype_str = "List[any]"
+                        else:
+                            try:
+                                ptype_str = f"List[{inner.__name__}]"
+                            except Exception:
+                                ptype_str = f"List[{str(inner)}]"
+                    except Exception:
+                        ptype_str = "List[any]"
+                elif porigin in (dict,):
+                    try:
+                        k = pargs[0] if pargs else None
+                        v = pargs[1] if len(pargs) > 1 else None
+                        k_str = getattr(k, "__name__", str(k)) if k else "any"
+                        v_str = getattr(v, "__name__", str(v)) if v else "any"
+                        ptype_str = f"Dict[{k_str}, {v_str}]"
+                    except Exception:
+                        ptype_str = "Dict[any, any]"
+                elif porigin in (tuple,):
+                    try:
+                        inner = ", ".join(getattr(a, "__name__", str(a)) for a in pargs) if pargs else ""
+                        ptype_str = f"Tuple[{inner}]"
+                    except Exception:
+                        ptype_str = "Tuple"
+                else:
+                    try:
+                        ptype_str = pann.__name__
+                    except Exception:
+                        ptype_str = str(pann)
+            default = None if p.default is inspect._empty else p.default
+            required = p.default is inspect._empty and p.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+            doc_entry = args_doc_map.get(pname, {})
+            f_params.append({
+                "name": pname,
+                "type": None if ptype_str == "any" else ptype_str,
+                "default": default,
+                "required": required,
+                "desc": doc_entry.get("desc", ""),
+            })
+
+        # Returns merge
+        ret_ann = sig.return_annotation
+        if ret_ann is inspect._empty:
+            ret_ann_str = "any"
+        else:
+            ro = get_origin(ret_ann)
+            ra = get_args(ret_ann)
+            if ro is Union:
+                non_none = [a for a in ra if a is not type(None)]
+                if len(non_none) == 1 and len(ra) == 2 and type(None) in ra:
+                    inner = non_none[0]
+                    try:
+                        ret_ann_str = f"Optional[{inner.__name__}]"
+                    except Exception:
+                        ret_ann_str = f"Optional[{str(inner)}]"
+                else:
+                    parts = []
+                    for a in ra:
+                        try:
+                            parts.append(a.__name__)
+                        except Exception:
+                            parts.append(str(a))
+                    ret_ann_str = " | ".join(parts)
+            elif ro in (list,):
+                try:
+                    inner = ra[0] if ra else None
+                    if inner is None:
+                        ret_ann_str = "List[any]"
+                    else:
+                        try:
+                            ret_ann_str = f"List[{inner.__name__}]"
+                        except Exception:
+                            ret_ann_str = f"List[{str(inner)}]"
+                except Exception:
+                    ret_ann_str = "List[any]"
+            elif ro in (dict,):
+                try:
+                    k = ra[0] if ra else None
+                    v = ra[1] if len(ra) > 1 else None
+                    k_str = getattr(k, "__name__", str(k)) if k else "any"
+                    v_str = getattr(v, "__name__", str(v)) if v else "any"
+                    ret_ann_str = f"Dict[{k_str}, {v_str}]"
+                except Exception:
+                    ret_ann_str = "Dict[any, any]"
+            elif ro in (tuple,):
+                try:
+                    inner = ", ".join(getattr(a, "__name__", str(a)) for a in ra) if ra else ""
+                    ret_ann_str = f"Tuple[{inner}]"
+                except Exception:
+                    ret_ann_str = "Tuple"
+            else:
+                try:
+                    ret_ann_str = ret_ann.__name__
+                except Exception:
+                    ret_ann_str = str(ret_ann)
+        if not f_returns:
+            f_returns = {"type": None if ret_ann_str == "any" else ret_ann_str, "desc": ""}
+        else:
+            if f_returns.get("type") is None and ret_ann_str != "any":
+                f_returns["type"] = ret_ann_str
+
+        # ----- Render function Markdown -----
+        lines.append(f"{h1} Function `{obj_name}`")
+        lines.append("")
+        lines.append(f"- Module: `{obj_module}`")
+        lines.append(f"- Qualname: `{obj_qualname}`")
+        lines.append("")
+        if include_signature:
+            lines.append(f"{h2} Signature")
+            lines.append("")
+            lines.append("```python")
+            lines.append(f"def {obj_name}{sig}")
+            lines.append("```")
+            lines.append("")
+        if "summary" in sec and f_summary:
+            lines.append(f"{h2} Summary")
+            lines.append(f_summary)
+            lines.append("")
+        if "description" in sec and f_description:
+            lines.append(f"{h2} Description")
+            lines.append(f_description)
+            lines.append("")
+        if "parameters" in sec and f_params:
+            if render_tables:
+                lines.append(f"{h2} Parameters")
+                lines.append("")
+                lines.append("| Name | Type | Required | Default | Description |")
+                lines.append("| ---- | ---- | -------- | ------- | ----------- |")
+                for p in f_params:
+                    typ = p["type"] or "any"
+                    req = "yes" if p["required"] else "no"
+                    default = "" if p["default"] is None else f"`{repr(p['default'])}`"
+                    desc = p["desc"] or ""
+                    lines.append(f"| `{p['name']}` | `{typ}` | {req} | {default} | {desc} |")
+                lines.append("")
+            else:
+                lines.append(f"{h2} Parameters")
+                for p in f_params:
+                    typ = p["type"] or "any"
+                    req = "required" if p["required"] else "optional"
+                    default = "" if p["default"] is None else f" (default={repr(p['default'])})"
+                    desc = f" - {p['desc']}" if p["desc"] else ""
+                    lines.append(f"- `{p['name']}`: {typ}, {req}{default}{desc}")
+                lines.append("")
+        if "returns" in sec and f_returns:
+            rtyp = f_returns.get("type") or "any"
+            rdesc = f_returns.get("desc") or ""
+            lines.append(f"{h2} Returns")
+            lines.append("")
+            lines.append(f"- Type: `{rtyp}`")
+            if rdesc:
+                lines.append(f"- Description: {rdesc}")
+            lines.append("")
+        if "raises" in sec and f_raises:
+            if f_raises:
+                lines.append(f"{h2} Raises")
+                lines.append("")
+                for r in f_raises:
+                    lines.append(f"- `{r['type']}`: {r['desc']}")
+                lines.append("")
+        if "examples" in sec and f_examples:
+            if f_examples:
+                lines.append(f"{h2} Examples")
+                lines.append("")
+                for ex in f_examples:
+                    lines.append("```python")
+                    lines.append(textwrap.dedent(ex).strip("\n"))
+                    lines.append("```")
+                    lines.append("")
+
+    markdown = "\n".join(lines).rstrip() + "\n"
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(markdown)
+    return markdown
+
+def google_search(
+    query: str,
+    location: Literal["China", "United States", "Germany", "France"] = None,
+    country: str = None,
+    language: str = None,
+    to_be_searched: str = None,
+    start: str = None,
+    num: str = None,
+):
+    """
+    Google search page result tool. When asked about a question, you can use this tool to get an original google search page result.
+    After browsing the search page result, you can pick some of the valuable result links to view by the `read_url` tool.
+
+    Args:
+        query (str): Parameter defines the query you want to search.
+            You can use anything that you would use in a regular Google search. e.g. inurl:, site:, intitle:.
+            We also support advanced search query parameters such as as_dt and as_eq.
+        location (str): Parameter defines from where you want the search to originate.
+            If several locations match the location requested, we'll pick the most popular one.
+            If location is omitted, the search may take on the location of the proxy.
+            When only the location parameter is set, Google may still take into account the proxy’s country, which can influence some results.
+            For more consistent country-specific filtering, use the `country` parameter alongside location.
+        country (str): Parameter defines the country to use for the Google search.
+            It's a two-letter country code. (e.g., cn for China, us for the United States, uk for United Kingdom, or fr for France).
+            Your country code should be supported by Google countries codes.
+        language (str): Parameter defines the language to use for the Google search.
+            It's a two-letter language code. (e.g., zh-cn for Chinese(Simplified), en for English, es for Spanish, or fr for French).
+            Your language code should be supported by Google languages.
+        to_be_searched (str): parameter defines advanced search parameters that aren't possible in the regular query field.
+            (e.g., advanced search for patents, dates, news, videos, images, apps, or text contents).
+        start (str): Parameter defines the result offset. It skips the given number of results.
+            It's used for pagination. (e.g., 0 (default) is the first page of results, 10 is the 2nd page of results, 20 is the 3rd page of results, etc.).
+            Google Local Results only accepts multiples of 20 (e.g. 20 for the second page results, 40 for the third page results, etc.) as the start value.
+        num (str): Parameter defines the maximum number of results to return.
+            (e.g., 10 (default) returns 10 results, 40 returns 40 results, and 100 returns 100 results).
+            The use of num may introduce latency, and/or prevent the inclusion of specialized result types.
+            It is better to omit this parameter unless it is strictly necessary to increase the number of results per page.
+            Results are not guaranteed to have the number of results specified in num.
+
+    Return:
+        (str) The search report in markdown format.
+    """
+
+    try:
+        import serpapi
+    except ImportError as e:
+        return 'No web search backend found, install by `pip install "parquool[websearch]"`'
+
+    api_keys = [key.strip() for key in os.getenv("SERPAPI_KEY").split(",")]
+    random.shuffle(api_keys)
+    param_names = ["location", "gl", "hl", "tbs", "start", "num"]
+    param_vars = [location, country, language, to_be_searched, start, num]
+    params = {"engine": "google", "q": query}
+    for name, param in zip(param_names, param_vars):
+        if param is not None:
+            params[name] = param
+
+    for api_key in api_keys:
+        try:
+            result = serpapi.search(params, api_key=api_key)
+        except Exception as e:
+            continue
+        result = result.as_dict()
+        break
+
+    else:
+        return f"Request failed, please check your parameter and try again."
+
+    search_metadata = result["search_metadata"]
+    search_report = (
+        f"# Search Report for Query {query}\n\n"
+        f"Created at {search_metadata['created_at']}, processed at {search_metadata['processed_at']}."
+        f"You can get access to json file at {search_metadata['json_endpoint']}, html file at {search_metadata['raw_html_file']}."
+        f"{result['search_information']['total_results']} Found. {search_metadata['total_time_taken']} seconds taken.\n\n"
+    )
+    for ores in result.get("organic_results", []):
+        search_report += (
+            f"## [{ores['title']}]({ores['link']})\n\n"
+            + f"[{ores['source']}] {ores['snippet']}\n\n"
+            + (f"> date: {ores['date']}\n" if "date" in ores.keys() else "")
+        )
+    return search_report
+
+def read_url(
+    url_or_urls: Union[str, List],
+    engine: Literal["direct", "browser"] = None,
+    return_format: Literal["markdown", "html", "text", "screeshot"] = None,
+    with_links_summary: Literal["all", "true"] = "true",
+    with_image_summary: Literal["all", "true"] = "true",
+    retain_image: bool = False,
+    do_not_track: bool = True,
+    set_cookie: str = None,
+    max_length_each: int = 100000,
+):
+    """Fetch and summarize the readable content of one or more URLs via the r.jina.ai reader proxy.
+
+    The agent should call this tool when it needs the actual page text or a snapshot of the page to
+    extract facts, quotes, or to decide whether the page is worth further processing.
+
+    Args:
+        url_or_urls (Union[str, List]): A single URL string or a list of URL strings to read.
+            Provide full URLs as produced by search results (e.g., "https://example.com/page").
+        engine (Literal["direct", "browser"], optional): Which fetching engine the proxy
+            should use. "direct" performs a direct HTTP fetch, "browser" uses a headless
+            browser to render the page (recommended for JS-heavy sites). If omitted, the
+            proxy service default is used.
+        return_format (Literal["markdown", "html", "text", "screeshot"], optional):
+            Desired format of the proxy's returned content:
+            - "markdown": proxy attempts to extract and return a clean Markdown version.
+            - "html": returns raw or minimally processed HTML.
+            - "text": plain text extraction.
+            - "screeshot": request an image capture of the page (note the implementation
+            currently expects the literal "screeshot").
+            If omitted, the proxy service default is used.
+        with_links_summary (Literal["all", "true"], optional):
+            Wether to summarize all the links in the end of the result page:
+            - "all": list all the links in the page and summarize them in the end.
+            - "true": list all the unique links in the page and summarize them in the end.
+            - None: keep links in-line in result.
+        with_image_summary (Literal["all", "true"], optional):
+            Wether to summarize all the images in the end of the result page:
+            - "all": list all the images in the page and summarize them in the end.
+            - "true": list all the unique images in the page and summarize them in the end.
+            - None: keep images in-line in result.
+        retain_image (bool, optional): If True (default), the returned HTML/Markdown may
+            include image references. If False, images are disabled/removed by the proxy.
+        do_not_track (bool, optional): If True (default), the header DNT: 1 is sent to
+            indicate "do not track" preference to the proxy.
+        set_cookie (str, optional): If provided, sets a Cookie header value to be passed
+            to the proxy (useful for accessing pages that require a specific cookie).
+        max_length_each (int, optional): Maximum number of characters to include from each
+            successful response in the returned report. Defaults to 7168. Longer pages will
+            be truncated to this length.
+
+    Returns:
+        str: A Markdown-formatted report string describing the results for each requested URL.
+        The report contains:
+        - A summary header with the number of input URLs.
+        - "Success Requests" section listing each successful URL and the first
+            max_length_each characters of the returned content.
+        - "Failure Requests" section listing each URL that failed and the associated
+            error message.
+    """
+    urls = url_or_urls if isinstance(url_or_urls, list) else [url_or_urls]
+    headers = {}
+    if engine:
+        headers["X-Engine"] = engine
+    if return_format:
+        headers["X-Return-Format"] = return_format
+    if with_links_summary:
+        headers["X-With-Links-Summary"] = with_links_summary
+    if with_image_summary:
+        headers["X-With-Images-Summary"] = with_image_summary
+    if not retain_image:
+        headers["X-Retain-Images"] = "none"
+    if do_not_track:
+        headers["DNT"] = "1"
+    if set_cookie:
+        headers["X-Set-Cookie"] = set_cookie
+    failure = []
+    success = []
+
+    for url in urls:
+        try:
+            response = requests.get(f"https://r.jina.ai/{url}", headers=headers)
+            response.raise_for_status()
+            success.append((url, response.text[:max_length_each]))
+        except Exception as e:
+            failure.append((url, str(e)))
+
+    read_report = f"# Read results for {len(urls)}\n\n"
+    read_report += "## Success Resquests\n\n"
+    for suc in success:
+        read_report += f"### {suc[0]}\n\n{suc[1]}"
+
+    read_report += "## Failure Resquests\n\n"
+    for fai in failure:
+        read_report += f"### {fai[0]}\n\n{fai[1]}"
+
+    return read_report
 
 class DuckParquet:
     """Manage a directory of Parquet files through a DuckDB-backed view.
@@ -1985,191 +3201,6 @@ class Agent:
         self.session = agents.SQLiteSession(
             session_id=self.session_id, db_path=self.session_db
         )
-
-    # ----------------- Built-in Tools -----------------
-
-    @staticmethod
-    def google_search(
-        query: str,
-        location: Literal["China", "United States", "Germany", "France"] = None,
-        country: str = None,
-        language: str = None,
-        to_be_searched: str = None,
-        start: str = None,
-        num: str = None,
-    ):
-        """
-        Google search page result tool. When asked about a question, you can use this tool to get an original google search page result.
-        After browsing the search page result, you can pick some of the valuable result links to view by the `read_url` tool.
-
-        Args:
-            query (str): Parameter defines the query you want to search.
-                You can use anything that you would use in a regular Google search. e.g. inurl:, site:, intitle:.
-                We also support advanced search query parameters such as as_dt and as_eq.
-            location (str): Parameter defines from where you want the search to originate.
-                If several locations match the location requested, we'll pick the most popular one.
-                If location is omitted, the search may take on the location of the proxy.
-                When only the location parameter is set, Google may still take into account the proxy’s country, which can influence some results.
-                For more consistent country-specific filtering, use the `country` parameter alongside location.
-            country (str): Parameter defines the country to use for the Google search.
-                It's a two-letter country code. (e.g., cn for China, us for the United States, uk for United Kingdom, or fr for France).
-                Your country code should be supported by Google countries codes.
-            language (str): Parameter defines the language to use for the Google search.
-                It's a two-letter language code. (e.g., zh-cn for Chinese(Simplified), en for English, es for Spanish, or fr for French).
-                Your language code should be supported by Google languages.
-            to_be_searched (str): parameter defines advanced search parameters that aren't possible in the regular query field.
-                (e.g., advanced search for patents, dates, news, videos, images, apps, or text contents).
-            start (str): Parameter defines the result offset. It skips the given number of results.
-                It's used for pagination. (e.g., 0 (default) is the first page of results, 10 is the 2nd page of results, 20 is the 3rd page of results, etc.).
-                Google Local Results only accepts multiples of 20 (e.g. 20 for the second page results, 40 for the third page results, etc.) as the start value.
-            num (str): Parameter defines the maximum number of results to return.
-                (e.g., 10 (default) returns 10 results, 40 returns 40 results, and 100 returns 100 results).
-                The use of num may introduce latency, and/or prevent the inclusion of specialized result types.
-                It is better to omit this parameter unless it is strictly necessary to increase the number of results per page.
-                Results are not guaranteed to have the number of results specified in num.
-
-        Return:
-            (str) The search report in markdown format.
-        """
-
-        try:
-            import serpapi
-        except ImportError as e:
-            return 'No web search backend found, install by `pip install "parquool[websearch]"`'
-
-        api_keys = [key.strip() for key in os.getenv("SERPAPI_KEY").split(",")]
-        random.shuffle(api_keys)
-        param_names = ["location", "gl", "hl", "tbs", "start", "num"]
-        param_vars = [location, country, language, to_be_searched, start, num]
-        params = {"engine": "google", "q": query}
-        for name, param in zip(param_names, param_vars):
-            if param is not None:
-                params[name] = param
-
-        for api_key in api_keys:
-            try:
-                result = serpapi.search(params, api_key=api_key)
-            except Exception as e:
-                continue
-            result = result.as_dict()
-            break
-
-        else:
-            return f"Request failed, please check your parameter and try again."
-
-        search_metadata = result["search_metadata"]
-        search_report = (
-            f"# Search Report for Query {query}\n\n"
-            f"Created at {search_metadata['created_at']}, processed at {search_metadata['processed_at']}."
-            f"You can get access to json file at {search_metadata['json_endpoint']}, html file at {search_metadata['raw_html_file']}."
-            f"{result['search_information']['total_results']} Found. {search_metadata['total_time_taken']} seconds taken.\n\n"
-        )
-        for ores in result.get("organic_results", []):
-            search_report += (
-                f"## [{ores['title']}]({ores['link']})\n\n"
-                + f"[{ores['source']}] {ores['snippet']}\n\n"
-                + (f"> date: {ores['date']}\n" if "date" in ores.keys() else "")
-            )
-        return search_report
-
-    @staticmethod
-    def read_url(
-        url_or_urls: Union[str, List],
-        engine: Literal["direct", "browser"] = None,
-        return_format: Literal["markdown", "html", "text", "screeshot"] = None,
-        with_links_summary: Literal["all", "true"] = "true",
-        with_image_summary: Literal["all", "true"] = "true",
-        retain_image: bool = False,
-        do_not_track: bool = True,
-        set_cookie: str = None,
-        max_length_each: int = 100000,
-    ):
-        """Fetch and summarize the readable content of one or more URLs via the r.jina.ai reader proxy.
-
-        The agent should call this tool when it needs the actual page text or a snapshot of the page to
-        extract facts, quotes, or to decide whether the page is worth further processing.
-
-        Args:
-            url_or_urls (Union[str, List]): A single URL string or a list of URL strings to read.
-                Provide full URLs as produced by search results (e.g., "https://example.com/page").
-            engine (Literal["direct", "browser"], optional): Which fetching engine the proxy
-                should use. "direct" performs a direct HTTP fetch, "browser" uses a headless
-                browser to render the page (recommended for JS-heavy sites). If omitted, the
-                proxy service default is used.
-            return_format (Literal["markdown", "html", "text", "screeshot"], optional):
-                Desired format of the proxy's returned content:
-                - "markdown": proxy attempts to extract and return a clean Markdown version.
-                - "html": returns raw or minimally processed HTML.
-                - "text": plain text extraction.
-                - "screeshot": request an image capture of the page (note the implementation
-                currently expects the literal "screeshot").
-                If omitted, the proxy service default is used.
-            with_links_summary (Literal["all", "true"], optional):
-                Wether to summarize all the links in the end of the result page:
-                - "all": list all the links in the page and summarize them in the end.
-                - "true": list all the unique links in the page and summarize them in the end.
-                - None: keep links in-line in result.
-            with_image_summary (Literal["all", "true"], optional):
-                Wether to summarize all the images in the end of the result page:
-                - "all": list all the images in the page and summarize them in the end.
-                - "true": list all the unique images in the page and summarize them in the end.
-                - None: keep images in-line in result.
-            retain_image (bool, optional): If True (default), the returned HTML/Markdown may
-                include image references. If False, images are disabled/removed by the proxy.
-            do_not_track (bool, optional): If True (default), the header DNT: 1 is sent to
-                indicate "do not track" preference to the proxy.
-            set_cookie (str, optional): If provided, sets a Cookie header value to be passed
-                to the proxy (useful for accessing pages that require a specific cookie).
-            max_length_each (int, optional): Maximum number of characters to include from each
-                successful response in the returned report. Defaults to 7168. Longer pages will
-                be truncated to this length.
-
-        Returns:
-            str: A Markdown-formatted report string describing the results for each requested URL.
-            The report contains:
-            - A summary header with the number of input URLs.
-            - "Success Requests" section listing each successful URL and the first
-                max_length_each characters of the returned content.
-            - "Failure Requests" section listing each URL that failed and the associated
-                error message.
-        """
-        urls = url_or_urls if isinstance(url_or_urls, list) else [url_or_urls]
-        headers = {}
-        if engine:
-            headers["X-Engine"] = engine
-        if return_format:
-            headers["X-Return-Format"] = return_format
-        if with_links_summary:
-            headers["X-With-Links-Summary"] = with_links_summary
-        if with_image_summary:
-            headers["X-With-Images-Summary"] = with_image_summary
-        if not retain_image:
-            headers["X-Retain-Images"] = "none"
-        if do_not_track:
-            headers["DNT"] = "1"
-        if set_cookie:
-            headers["X-Set-Cookie"] = set_cookie
-        failure = []
-        success = []
-
-        for url in urls:
-            try:
-                response = requests.get(f"https://r.jina.ai/{url}", headers=headers)
-                response.raise_for_status()
-                success.append((url, response.text[:max_length_each]))
-            except Exception as e:
-                failure.append((url, str(e)))
-
-        read_report = f"# Read results for {len(urls)}\n\n"
-        read_report += "## Success Resquests\n\n"
-        for suc in success:
-            read_report += f"### {suc[0]}\n\n{suc[1]}"
-
-        read_report += "## Failure Resquests\n\n"
-        for fai in failure:
-            read_report += f"### {fai[0]}\n\n{fai[1]}"
-
-        return read_report
 
     # ----------------- Internal helpers -----------------
 
