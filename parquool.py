@@ -6,6 +6,7 @@ import random
 import shutil
 import time
 import traceback
+import mimetypes
 import uuid
 from copy import deepcopy
 from functools import wraps
@@ -341,18 +342,7 @@ def notify_task(
                 # Attach images and files as needed
                 for i, file_path in enumerate(file_paths):
                     file = Path(file_path)
-                    if file.suffix.lower() in {
-                        ".png",
-                        ".jpg",
-                        ".jpeg",
-                        ".gif",
-                        ".xlsx",
-                        ".docx",
-                        "pptx",
-                        ".xls",
-                        ".doc",
-                        ".ppt",
-                    }:
+                    if file.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif"}:
                         with file.open("rb") as bin:
                             img_data = bin.read()
                             # Create a unique content ID
@@ -366,21 +356,19 @@ def notify_task(
                             # Replace the file path in the HTML body with a cid reference
                             html_body = html_body.replace(file_path, f"cid:{cid}")
                     else:
-                        try:
+                        ctype, _ = mimetypes.guess_type(file.name)
+                        if ctype and ctype.startswith("text/"):
                             part = MIMEText(file.read_text("utf-8"), "plain", "utf-8")
-                            part.add_header(
-                                "Content-Disposition",
-                                f"attachment; filename={file.name}",
-                            )
+                            part.add_header("Content-Disposition", f'attachment; filename="{file.name}"')
                             content.attach(part)
-                        except UnicodeDecodeError:
-                            part = MIMEBase("application", "octet-stream")
+                        else:
+                            ctype = ctype or "application/octet-stream"
+                            main, sub = ctype.split("/", 1)
+                            part = MIMEBase(main, sub)
                             part.set_payload(file.read_bytes())
                             encoders.encode_base64(part)
-                            part.add_header(
-                                "Content-Disposition",
-                                f"attachment; filename={file.name}",
-                            )
+                            part.add_header("Content-Disposition", f'attachment; filename="{file.name}"')
+                            part.add_header("Content-Type", f'{ctype}; name="{file.name}"')
                             content.attach(part)
 
                 # Update the HTML part with embedded image references
