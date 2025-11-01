@@ -719,7 +719,7 @@ def generate_usage(
                                         parts.append(a.__name__)
                                     except Exception:
                                         parts.append(str(a))
-                                ptype_str = " | ".join(parts)
+                                ptype_str = " or ".join(parts)
                         elif porigin in (list,):
                             try:
                                 inner = pargs[0] if pargs else None
@@ -936,7 +936,7 @@ def generate_usage(
                                         parts.append(a.__name__)
                                     except Exception:
                                         parts.append(str(a))
-                                ptype_str = " | ".join(parts)
+                                ptype_str = " or ".join(parts)
                         elif porigin in (list,):
                             try:
                                 inner = pargs[0] if pargs else None
@@ -1006,7 +1006,7 @@ def generate_usage(
                                     parts.append(a.__name__)
                                 except Exception:
                                     parts.append(str(a))
-                            ret_ann_str = " | ".join(parts)
+                            ret_ann_str = " or ".join(parts)
                     elif ro in (list,):
                         try:
                             inner = ra[0] if ra else None
@@ -1298,7 +1298,7 @@ def generate_usage(
                                 parts.append(a.__name__)
                             except Exception:
                                 parts.append(str(a))
-                        ptype_str = " | ".join(parts)
+                        ptype_str = " or ".join(parts)
                 elif porigin in (list,):
                     try:
                         inner = pargs[0] if pargs else None
@@ -1368,7 +1368,7 @@ def generate_usage(
                             parts.append(a.__name__)
                         except Exception:
                             parts.append(str(a))
-                    ret_ann_str = " | ".join(parts)
+                    ret_ann_str = " or ".join(parts)
             elif ro in (list,):
                 try:
                     inner = ra[0] if ra else None
