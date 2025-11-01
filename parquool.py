@@ -458,6 +458,7 @@ def proxy_request(
     response.raise_for_status()
     return response
 
+
 def generate_usage(
     target: object,
     output_path: Optional[str] = None,
@@ -539,7 +540,16 @@ def generate_usage(
         >>> print(md)
     """
     # Validate/normalize rendering controls
-    allowed_sections = {"summary","description","attributes","methods","parameters","returns","raises","examples"}
+    allowed_sections = {
+        "summary",
+        "description",
+        "attributes",
+        "methods",
+        "parameters",
+        "returns",
+        "raises",
+        "examples",
+    }
     sec = set(include_sections) if include_sections else allowed_sections
     sec = sec.intersection(allowed_sections)
     if sort_methods not in ("name", "kind", "none"):
@@ -561,7 +571,9 @@ def generate_usage(
 
     # Common metadata
     obj_module = getattr(target, "__module__", "")
-    obj_qualname = getattr(target, "__qualname__", getattr(target, "__name__", str(target)))
+    obj_qualname = getattr(
+        target, "__qualname__", getattr(target, "__name__", str(target))
+    )
     obj_name = getattr(target, "__name__", str(target))
 
     # Build output lines
@@ -611,7 +623,9 @@ def generate_usage(
                 else:
                     section_buffer["description"].append(line)
                 i += 1
-            cls_description = "\n".join([x.rstrip() for x in section_buffer["description"]]).strip()
+            cls_description = "\n".join(
+                [x.rstrip() for x in section_buffer["description"]]
+            ).strip()
 
             # Parse Attributes items
             items = []
@@ -619,12 +633,18 @@ def generate_usage(
             for b in section_buffer["Attributes"]:
                 if not b.strip():
                     continue
-                m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(\(([^)]*)\))?\s*:\s*(.*)$", b)
+                m = re.match(
+                    r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(\(([^)]*)\))?\s*:\s*(.*)$", b
+                )
                 if m:
                     name_i = m.group(1)
                     type_i = m.group(3)
                     desc_i = m.group(4).strip()
-                    current = {"name": name_i, "type": (type_i.strip() if type_i else None), "desc": desc_i}
+                    current = {
+                        "name": name_i,
+                        "type": (type_i.strip() if type_i else None),
+                        "desc": desc_i,
+                    }
                     items.append(current)
                 else:
                     if current:
@@ -649,7 +669,11 @@ def generate_usage(
         # ----- Collect attributes (merge @property) -----
         attr_map = {}
         for a in cls_attributes:
-            attr_map[a["name"]] = {"name": a["name"], "type": a.get("type"), "desc": a.get("desc", "")}
+            attr_map[a["name"]] = {
+                "name": a["name"],
+                "type": a.get("type"),
+                "desc": a.get("desc", ""),
+            }
 
         if include_properties:
             for name, _ in inspect.getmembers(target):
@@ -676,7 +700,14 @@ def generate_usage(
                         while pi < pn and not PL[pi].strip():
                             pi += 1
                         p_section = None
-                        p_buffer = {"description": [], "Args": [], "Returns": [], "Raises": [], "Attributes": [], "Examples": []}
+                        p_buffer = {
+                            "description": [],
+                            "Args": [],
+                            "Returns": [],
+                            "Raises": [],
+                            "Attributes": [],
+                            "Examples": [],
+                        }
                         p_headers = set(p_buffer.keys())
                         while pi < pn:
                             pline = PL[pi]
@@ -692,7 +723,9 @@ def generate_usage(
                             else:
                                 p_buffer["description"].append(pline)
                             pi += 1
-                        p_description = "\n".join([x.rstrip() for x in p_buffer["description"]]).strip()
+                        p_description = "\n".join(
+                            [x.rstrip() for x in p_buffer["description"]]
+                        ).strip()
                     # property type from return annotation
                     try:
                         pann = stat.fget.__annotations__.get("return", inspect._empty)
@@ -706,7 +739,11 @@ def generate_usage(
                         pargs = get_args(pann)
                         if porigin is Union:
                             non_none = [a for a in pargs if a is not type(None)]
-                            if len(non_none) == 1 and len(pargs) == 2 and type(None) in pargs:
+                            if (
+                                len(non_none) == 1
+                                and len(pargs) == 2
+                                and type(None) in pargs
+                            ):
                                 inner = non_none[0]
                                 try:
                                     ptype_str = f"Optional[{inner.__name__}]"
@@ -743,7 +780,13 @@ def generate_usage(
                                 ptype_str = "Dict[any, any]"
                         elif porigin in (tuple,):
                             try:
-                                inner = ", ".join(getattr(a, "__name__", str(a)) for a in pargs) if pargs else ""
+                                inner = (
+                                    ", ".join(
+                                        getattr(a, "__name__", str(a)) for a in pargs
+                                    )
+                                    if pargs
+                                    else ""
+                                )
                                 ptype_str = f"Tuple[{inner}]"
                             except Exception:
                                 ptype_str = "Tuple"
@@ -755,7 +798,9 @@ def generate_usage(
                     entry = {
                         "name": name,
                         "type": None if ptype_str == "any" else ptype_str,
-                        "desc": p_summary or p_description or attr_map.get(name, {}).get("desc", ""),
+                        "desc": p_summary
+                        or p_description
+                        or attr_map.get(name, {}).get("desc", ""),
                     }
                     if name in attr_map:
                         if not attr_map[name].get("type") and entry["type"]:
@@ -791,9 +836,15 @@ def generate_usage(
                 elif isinstance(stat, classmethod):
                     kind = "class"
                     func = stat.__func__
-                elif inspect.isfunction(stat) or inspect.ismethod(stat) or inspect.isroutine(stat):
+                elif (
+                    inspect.isfunction(stat)
+                    or inspect.ismethod(stat)
+                    or inspect.isroutine(stat)
+                ):
                     kind = "instance"
-                    func = member if inspect.isfunction(member) else getattr(target, name)
+                    func = (
+                        member if inspect.isfunction(member) else getattr(target, name)
+                    )
                 else:
                     continue
 
@@ -831,7 +882,14 @@ def generate_usage(
                     while mi < mn and not ML[mi].strip():
                         mi += 1
                     m_section = None
-                    m_buffer = {"description": [], "Args": [], "Returns": [], "Raises": [], "Attributes": [], "Examples": []}
+                    m_buffer = {
+                        "description": [],
+                        "Args": [],
+                        "Returns": [],
+                        "Raises": [],
+                        "Attributes": [],
+                        "Examples": [],
+                    }
                     m_headers = set(m_buffer.keys())
                     while mi < mn:
                         ml = ML[mi]
@@ -847,18 +905,27 @@ def generate_usage(
                         else:
                             m_buffer["description"].append(ml)
                         mi += 1
-                    m_description = "\n".join([x.rstrip() for x in m_buffer["description"]]).strip()
+                    m_description = "\n".join(
+                        [x.rstrip() for x in m_buffer["description"]]
+                    ).strip()
                     # Args
                     current = None
                     for b in m_buffer["Args"]:
                         if not b.strip():
                             continue
-                        mm = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(\(([^)]*)\))?\s*:\s*(.*)$", b)
+                        mm = re.match(
+                            r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(\(([^)]*)\))?\s*:\s*(.*)$",
+                            b,
+                        )
                         if mm:
                             an = mm.group(1)
                             at = mm.group(3)
                             ad = mm.group(4).strip()
-                            current = {"name": an, "type": (at.strip() if at else None), "desc": ad}
+                            current = {
+                                "name": an,
+                                "type": (at.strip() if at else None),
+                                "desc": ad,
+                            }
                             m_args.append(current)
                         else:
                             if current:
@@ -866,7 +933,9 @@ def generate_usage(
                     # Returns
                     ret_lines = [l for l in m_buffer["Returns"] if l.strip()]
                     if ret_lines:
-                        mmr = re.match(r"^\s*([^:]+?)\s*:\s*(.*)$", ret_lines[0].strip())
+                        mmr = re.match(
+                            r"^\s*([^:]+?)\s*:\s*(.*)$", ret_lines[0].strip()
+                        )
                         if mmr:
                             rt = mmr.group(1).strip()
                             rd = mmr.group(2).strip()
@@ -923,7 +992,11 @@ def generate_usage(
                         pargs = get_args(pann)
                         if porigin is Union:
                             non_none = [a for a in pargs if a is not type(None)]
-                            if len(non_none) == 1 and len(pargs) == 2 and type(None) in pargs:
+                            if (
+                                len(non_none) == 1
+                                and len(pargs) == 2
+                                and type(None) in pargs
+                            ):
                                 inner = non_none[0]
                                 try:
                                     ptype_str = f"Optional[{inner.__name__}]"
@@ -960,7 +1033,13 @@ def generate_usage(
                                 ptype_str = "Dict[any, any]"
                         elif porigin in (tuple,):
                             try:
-                                inner = ", ".join(getattr(a, "__name__", str(a)) for a in pargs) if pargs else ""
+                                inner = (
+                                    ", ".join(
+                                        getattr(a, "__name__", str(a)) for a in pargs
+                                    )
+                                    if pargs
+                                    else ""
+                                )
                                 ptype_str = f"Tuple[{inner}]"
                             except Exception:
                                 ptype_str = "Tuple"
@@ -976,13 +1055,15 @@ def generate_usage(
                         inspect.Parameter.KEYWORD_ONLY,
                     )
                     doc_entry = args_doc_map.get(pname, {})
-                    params.append({
-                        "name": pname,
-                        "type": None if ptype_str == "any" else ptype_str,
-                        "default": default,
-                        "required": required,
-                        "desc": doc_entry.get("desc", ""),
-                    })
+                    params.append(
+                        {
+                            "name": pname,
+                            "type": None if ptype_str == "any" else ptype_str,
+                            "default": default,
+                            "required": required,
+                            "desc": doc_entry.get("desc", ""),
+                        }
+                    )
 
                 # Returns merge
                 ret_ann = sig.return_annotation
@@ -1030,7 +1111,11 @@ def generate_usage(
                             ret_ann_str = "Dict[any, any]"
                     elif ro in (tuple,):
                         try:
-                            inner = ", ".join(getattr(a, "__name__", str(a)) for a in ra) if ra else ""
+                            inner = (
+                                ", ".join(getattr(a, "__name__", str(a)) for a in ra)
+                                if ra
+                                else ""
+                            )
                             ret_ann_str = f"Tuple[{inner}]"
                         except Exception:
                             ret_ann_str = "Tuple"
@@ -1040,23 +1125,28 @@ def generate_usage(
                         except Exception:
                             ret_ann_str = str(ret_ann)
                 if not m_returns:
-                    m_returns = {"type": None if ret_ann_str == "any" else ret_ann_str, "desc": ""}
+                    m_returns = {
+                        "type": None if ret_ann_str == "any" else ret_ann_str,
+                        "desc": "",
+                    }
                 else:
                     if m_returns.get("type") is None and ret_ann_str != "any":
                         m_returns["type"] = ret_ann_str
 
-                methods.append({
-                    "name": name,
-                    "kind": kind,
-                    "async": inspect.iscoroutinefunction(func),
-                    "signature": str(sig),
-                    "summary": m_summary,
-                    "description": m_description,
-                    "parameters": params,
-                    "returns": m_returns,
-                    "raises": m_raises,
-                    "examples": m_examples,
-                })
+                methods.append(
+                    {
+                        "name": name,
+                        "kind": kind,
+                        "async": inspect.iscoroutinefunction(func),
+                        "signature": str(sig),
+                        "summary": m_summary,
+                        "description": m_description,
+                        "parameters": params,
+                        "returns": m_returns,
+                        "raises": m_raises,
+                        "examples": m_examples,
+                    }
+                )
 
         # Sort methods
         if sort_methods == "name":
@@ -1128,23 +1218,39 @@ def generate_usage(
                     if render_tables:
                         lines.append("**Parameters**")
                         lines.append("")
-                        lines.append("| Name | Type | Required | Default | Description |")
-                        lines.append("| ---- | ---- | -------- | ------- | ----------- |")
+                        lines.append(
+                            "| Name | Type | Required | Default | Description |"
+                        )
+                        lines.append(
+                            "| ---- | ---- | -------- | ------- | ----------- |"
+                        )
                         for p in m["parameters"]:
                             typ = p["type"] or "any"
                             req = "yes" if p["required"] else "no"
-                            default = "" if p["default"] is None else f"`{repr(p['default'])}`"
+                            default = (
+                                ""
+                                if p["default"] is None
+                                else f"`{repr(p['default'])}`"
+                            )
                             desc = p["desc"] or ""
-                            lines.append(f"| `{p['name']}` | `{typ}` | {req} | {default} | {desc} |")
+                            lines.append(
+                                f"| `{p['name']}` | `{typ}` | {req} | {default} | {desc} |"
+                            )
                         lines.append("")
                     else:
                         lines.append("**Parameters**")
                         for p in m["parameters"]:
                             typ = p["type"] or "any"
                             req = "required" if p["required"] else "optional"
-                            default = "" if p["default"] is None else f" (default={repr(p['default'])})"
+                            default = (
+                                ""
+                                if p["default"] is None
+                                else f" (default={repr(p['default'])})"
+                            )
                             desc = f" - {p['desc']}" if p["desc"] else ""
-                            lines.append(f"- `{p['name']}`: {typ}, {req}{default}{desc}")
+                            lines.append(
+                                f"- `{p['name']}`: {typ}, {req}{default}{desc}"
+                            )
                         lines.append("")
                 if "returns" in sec and m["returns"]:
                     rtyp = m["returns"].get("type") or "any"
@@ -1198,7 +1304,14 @@ def generate_usage(
             while fi < fn and not FL[fi].strip():
                 fi += 1
             f_section = None
-            f_buffer = {"description": [], "Args": [], "Returns": [], "Raises": [], "Attributes": [], "Examples": []}
+            f_buffer = {
+                "description": [],
+                "Args": [],
+                "Returns": [],
+                "Raises": [],
+                "Attributes": [],
+                "Examples": [],
+            }
             f_headers = set(f_buffer.keys())
             while fi < fn:
                 fl = FL[fi]
@@ -1214,18 +1327,26 @@ def generate_usage(
                 else:
                     f_buffer["description"].append(fl)
                 fi += 1
-            f_description = "\n".join([x.rstrip() for x in f_buffer["description"]]).strip()
+            f_description = "\n".join(
+                [x.rstrip() for x in f_buffer["description"]]
+            ).strip()
             # Args
             current = None
             for b in f_buffer["Args"]:
                 if not b.strip():
                     continue
-                mm = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(\(([^)]*)\))?\s*:\s*(.*)$", b)
+                mm = re.match(
+                    r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(\(([^)]*)\))?\s*:\s*(.*)$", b
+                )
                 if mm:
                     an = mm.group(1)
                     at = mm.group(3)
                     ad = mm.group(4).strip()
-                    current = {"name": an, "type": (at.strip() if at else None), "desc": ad}
+                    current = {
+                        "name": an,
+                        "type": (at.strip() if at else None),
+                        "desc": ad,
+                    }
                     f_args.append(current)
                 else:
                     if current:
@@ -1322,7 +1443,11 @@ def generate_usage(
                         ptype_str = "Dict[any, any]"
                 elif porigin in (tuple,):
                     try:
-                        inner = ", ".join(getattr(a, "__name__", str(a)) for a in pargs) if pargs else ""
+                        inner = (
+                            ", ".join(getattr(a, "__name__", str(a)) for a in pargs)
+                            if pargs
+                            else ""
+                        )
                         ptype_str = f"Tuple[{inner}]"
                     except Exception:
                         ptype_str = "Tuple"
@@ -1338,13 +1463,15 @@ def generate_usage(
                 inspect.Parameter.KEYWORD_ONLY,
             )
             doc_entry = args_doc_map.get(pname, {})
-            f_params.append({
-                "name": pname,
-                "type": None if ptype_str == "any" else ptype_str,
-                "default": default,
-                "required": required,
-                "desc": doc_entry.get("desc", ""),
-            })
+            f_params.append(
+                {
+                    "name": pname,
+                    "type": None if ptype_str == "any" else ptype_str,
+                    "default": default,
+                    "required": required,
+                    "desc": doc_entry.get("desc", ""),
+                }
+            )
 
         # Returns merge
         ret_ann = sig.return_annotation
@@ -1392,7 +1519,11 @@ def generate_usage(
                     ret_ann_str = "Dict[any, any]"
             elif ro in (tuple,):
                 try:
-                    inner = ", ".join(getattr(a, "__name__", str(a)) for a in ra) if ra else ""
+                    inner = (
+                        ", ".join(getattr(a, "__name__", str(a)) for a in ra)
+                        if ra
+                        else ""
+                    )
                     ret_ann_str = f"Tuple[{inner}]"
                 except Exception:
                     ret_ann_str = "Tuple"
@@ -1402,7 +1533,10 @@ def generate_usage(
                 except Exception:
                     ret_ann_str = str(ret_ann)
         if not f_returns:
-            f_returns = {"type": None if ret_ann_str == "any" else ret_ann_str, "desc": ""}
+            f_returns = {
+                "type": None if ret_ann_str == "any" else ret_ann_str,
+                "desc": "",
+            }
         else:
             if f_returns.get("type") is None and ret_ann_str != "any":
                 f_returns["type"] = ret_ann_str
@@ -1439,14 +1573,20 @@ def generate_usage(
                     req = "yes" if p["required"] else "no"
                     default = "" if p["default"] is None else f"`{repr(p['default'])}`"
                     desc = p["desc"] or ""
-                    lines.append(f"| `{p['name']}` | `{typ}` | {req} | {default} | {desc} |")
+                    lines.append(
+                        f"| `{p['name']}` | `{typ}` | {req} | {default} | {desc} |"
+                    )
                 lines.append("")
             else:
                 lines.append(f"{h2} Parameters")
                 for p in f_params:
                     typ = p["type"] or "any"
                     req = "required" if p["required"] else "optional"
-                    default = "" if p["default"] is None else f" (default={repr(p['default'])})"
+                    default = (
+                        ""
+                        if p["default"] is None
+                        else f" (default={repr(p['default'])})"
+                    )
                     desc = f" - {p['desc']}" if p["desc"] else ""
                     lines.append(f"- `{p['name']}`: {typ}, {req}{default}{desc}")
                 lines.append("")
@@ -1481,6 +1621,7 @@ def generate_usage(
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(markdown)
     return markdown
+
 
 def google_search(
     query: str,
@@ -1564,6 +1705,7 @@ def google_search(
             + (f"> date: {ores['date']}\n" if "date" in ores.keys() else "")
         )
     return search_report
+
 
 def read_url(
     url_or_urls: Union[str, List],
@@ -1662,6 +1804,7 @@ def read_url(
         read_report += f"### {fai[0]}\n\n{fai[1]}"
 
     return read_report
+
 
 class DuckParquet:
     """Manage a directory of Parquet files through a DuckDB-backed view.
@@ -3138,10 +3281,7 @@ class Agent:
                 )
 
         self.function_tools = []
-        self.tools = {
-            "export_conversation": self.export_conversation,
-            "get_conversation": self.get_conversation,
-        }
+        self.tools = {}
         for fnt in tools or []:
             if isinstance(fnt, agents.Tool):
                 self.function_tools.append(fnt)
