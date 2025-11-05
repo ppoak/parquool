@@ -67,6 +67,7 @@ class DuckParquet:
         self,
         dataset_path: str,
         name: Optional[str] = None,
+        create: bool = False,
         db_path: str = None,
         threads: Optional[int] = None,
     ):
@@ -75,6 +76,7 @@ class DuckParquet:
         Args:
             dataset_path (str): Directory path that stores the parquet dataset.
             name (Optional[str]): The view name. Defaults to directory basename.
+            create (bool): If True, create the directory if it doesn't exist.
             db_path (str): Path to DuckDB database file. Defaults to in-memory.
             threads (Optional[int]): Number of threads used for partition operations.
 
@@ -83,7 +85,10 @@ class DuckParquet:
         """
         self.dataset_path = Path(dataset_path)
         if not self.dataset_path.exists():
-            self.dataset_path.mkdir(exist_ok=True, parents=True)
+            if create:
+                self.dataset_path.mkdir(exist_ok=True, parents=True)
+            else:
+                raise ValueError("Dataset path doesn't exist, check your spell.")
         if not self.dataset_path.is_dir():
             raise ValueError("Only directory is valid in dataset_path param")
         self.view_name = name or self._default_view_name(self.dataset_path)

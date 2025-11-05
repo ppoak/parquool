@@ -468,7 +468,7 @@ def generate_usage(
             "examples",
         ]
     ] = None,
-    heading_level: int = 1,
+    heading_level: int = 2,
 ) -> str:
     """Generate a GitHub-friendly Markdown usage document for a Python class or function.
 
