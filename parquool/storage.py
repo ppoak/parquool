@@ -411,7 +411,7 @@ class DuckParquet:
     @property
     def empty(self) -> bool:
         """Return true if the duck parquet path is empty"""
-        return self._parquet_files_exist()
+        return not self._parquet_files_exist()
 
     @property
     def columns(self) -> List[str]:
