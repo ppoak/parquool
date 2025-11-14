@@ -17,9 +17,8 @@ from typing import (
 
 import dotenv
 import agents
-import litellm
+import openai
 from openai.types.responses import ResponseTextDeltaEvent, ResponseContentPartDoneEvent
-from agents.extensions.models.litellm_model import LitellmModel
 
 from .util import setup_logger
 
@@ -110,8 +109,8 @@ class Collection:
     """Manage an LLM agent knowledge store backed by a persistent Chroma vector database and OpenAI-compatible embeddings.
 
     This class provides convenience methods to ingest text files, split them into chunks, compute embeddings,
-    store and retrieve vectors from a persistent Chroma instance, and optionally apply an LLM-based reranker.
-    It centralizes configuration for embedding and reranking models, vector DB path, chunking behavior, and logging.
+    store and retrieve vectors from a persistent Chroma instance.
+    It centralizes configuration for embedding, vector DB path, chunking behavior, and logging.
 
     Attributes:
         default_collection (str): Default collection name used when none is provided to load/search methods.
@@ -119,12 +118,9 @@ class Collection:
         chunk_size (int): Maximum number of characters per chunk when splitting documents.
         chunk_overlap (int): Number of characters overlapping between adjacent chunks.
         retrieval_top_k (int): Default number of top vector search results to return.
-        reranker_model (Optional[str]): Optional model name for LLM-based reranking. When None, reranking is disabled.
-        rerank_top_k (int): Number of documents to keep after reranking (or used as reranker top_n).
         _vector_db_path (str): Filesystem path where the Chroma persistent database is stored.
         _chroma (chromadb.PersistentClient): Underlying persistent Chroma client instance.
         collections (Dict[str, _ChromaVectorStore]): In-memory map of collection name to _ChromaVectorStore wrappers.
-        _rerank_fn (Optional[Callable]): Internal callable performing reranking when configured.
         logger: Logger instance used for informational and error messages.
 
     Example:
@@ -143,27 +139,23 @@ class Collection:
         chunk_overlap: int = 200,
         retrieval_top_k: int = 5,
         vector_db_path: str = None,
-        reranker_model: Optional[str] = None,
-        rerank_top_k: Optional[int] = None,
         log_level: str = "INFO",
         log_file: Union[str, Path] = None,
     ):
         """Initialize a Collection used as an LLM agent knowledge store backed by Chroma and OpenAI embeddings.
 
         This constructor sets up the OpenAI client, embedding model, persistent Chroma client,
-        local collections map, optional LLM reranker, and logging.
+        local collections map, optional logging.
 
         Args:
             default_collection (str): Default collection name to use for loading and searching knowledge.
-            base_url (Optional[str]): Base URL for the OpenAI-compatible API. If None, read from LITELLM_BASE_URL env.
-            api_key (Optional[str]): API key for the OpenAI-compatible API. If None, read from LITELLM_API_KEY env.
-            embedding_model (Optional[str]): Embedding model name. If None, read from LITELLM_EMBEDDING_MODEL env.
+            base_url (Optional[str]): Base URL for the OpenAI-compatible API. If None, read from OPENAI_BASE_URL env.
+            api_key (Optional[str]): API key for the OpenAI-compatible API. If None, read from OPENAI_API_KEY env.
+            embedding_model (Optional[str]): Embedding model name. If None, read from OPENAI_EMBEDDING_MODEL env.
             chunk_size (int): Maximum number of characters per text chunk.
             chunk_overlap (int): Overlap size in characters between adjacent chunks.
             retrieval_top_k (int): Number of top vector search results to return by default.
             vector_db_path (Optional[str]): Filesystem path to persist Chroma DB. If None, read from AGENT_VECTOR_DB_PATH env or default '.knowledge'.
-            reranker_model (Optional[str]): Optional reranker model name used for LLM-based re-ranking.
-            rerank_top_k (Optional[int]): Number of documents to keep after reranking. If None, uses retrieval_top_k.
             log_level (str): Logging level name.
             log_file (Optional[Union[str, Path]]): Optional path to a log file.
 
@@ -176,10 +168,14 @@ class Collection:
                 'Chroma backend not found, please install with `pip install "parquool[knowledge]"`'
             )
         self.base_url = (
-            base_url or os.getenv("LITELLM_BASE_URL") or "https://api.openai.com/v1"
+            base_url or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
         )
-        self.api_key = api_key or os.getenv("LITELLM_API_KEY")
-        self.embedding_model = embedding_model or os.getenv("LITELLM_EMBEDDING_MODEL")
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.embedding_model = embedding_model or os.getenv("OPENAI_EMBEDDING_MODEL")
+        self._oai_sync = openai.OpenAI(
+            base_url=base_url or os.getenv("OPENAI_BASE_URL"),
+            api_key=api_key or os.getenv("OPENAI_API_KEY"),
+        )
         self.default_collection = default_collection
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
@@ -193,10 +189,6 @@ class Collection:
         self._chroma = chromadb.PersistentClient(path=self._vector_db_path)
         self.collections: Dict[str, Agent._MemoryVectorStore] = {}
         self._hydrate_persistent_collections()
-        self._rerank_fn = None
-        self.reranker_model = reranker_model or os.getenv("LITELLM_RERANKER_MODEL")
-        self.rerank_top_k = rerank_top_k or retrieval_top_k
-        self._setup_reranker()
 
     # ----------------- Vector database / Embeddings basic tools -----------------
 
@@ -238,13 +230,11 @@ class Collection:
         if not texts:
             return []
         try:
-            resp = litellm.embedding(
-                model=self.embedding_model,
+            resp = self._oai_sync.embeddings.create(
                 input=texts,
-                api_base=self.base_url,
-                api_key=self.api_key,
+                model=self.embedding_model,
             )
-            return [d["embedding"] for d in resp.data]
+            return [d.embedding for d in resp.data]
         except Exception as e:
             self.logger.error(f"Embedding failed: {e}")
             raise
@@ -361,110 +351,6 @@ class Collection:
         self.logger.info(f"Skip non-text file: {path}")
         return ""
 
-    def _setup_reranker(self):
-        """Configure an optional LLM-based reranking function if a reranker model is provided.
-
-        The configured rerank function will call litellm.rerank with the configured model and
-        normalize the returned results into a list of {"index": int, "score": float} items.
-        If no reranker_model is set, the method is a no-op.
-        """
-        if not self.reranker_model:
-            self.logger.debug("No reranker model configured; skip reranking.")
-            return
-
-        def _llm_rerank(
-            query: str, docs: List[str], metas: List[Dict], top_n: Optional[int] = None
-        ):
-            if not docs:
-                return []
-            top_n = min(top_n or len(docs), len(docs))
-
-            data = litellm.rerank(
-                model=self.reranker_model,
-                query=query,
-                documents=docs,
-                top_n=top_n,
-                return_documents=False,
-                api_base=self.base_url,
-                api_key=self.api_key,
-            )
-
-            items = None
-            if isinstance(data, dict):
-                items = data.get("results")
-            if not isinstance(items, list):
-                items = data if isinstance(data, list) else []
-
-            out = []
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                idx = it.get("index")
-                if idx is None:
-                    continue
-                score = it.get("relevance_score")
-                try:
-                    idx = int(idx)
-                except Exception:
-                    continue
-                try:
-                    score = float(score) if score is not None else None
-                except Exception:
-                    score = None
-                if 0 <= idx < len(docs):
-                    out.append({"index": idx, "score": score})
-
-            if out and all(o.get("score") is not None for o in out):
-                out.sort(key=lambda x: x["score"], reverse=True)
-            return out[:top_n]
-
-        self._rerank_fn = _llm_rerank
-        self.logger.info(f"LLM reranker enabled (model={self.reranker_model}).")
-
-    def _normalize_rerank_result(
-        self, res: List, n_docs: int
-    ) -> List[Tuple[int, Optional[float]]]:
-        """Normalize various reranker result formats into a list of (index, score) tuples.
-
-        Accepts integer indices, (index, score) tuples/lists, or dicts with 'index' and optional 'score'.
-        Filters out invalid indices and sorts by score descending if all items have scores.
-
-        Args:
-            res (List): Raw reranker output in one of several accepted formats.
-            n_docs (int): Number of documents that were reranked (used to validate indices).
-
-        Returns:
-            List[Tuple[int, Optional[float]]]: Normalized and optionally sorted list of (index, score).
-        """
-        ranked: List[Tuple[int, Optional[float]]] = []
-        if not isinstance(res, list) or not res:
-            return ranked
-        for item in res:
-            idx = None
-            score = None
-            if isinstance(item, int):
-                idx = item
-            elif isinstance(item, (tuple, list)) and len(item) >= 1:
-                idx = int(item[0])
-                if len(item) > 1:
-                    try:
-                        score = float(item[1])
-                    except Exception:
-                        score = None
-            elif isinstance(item, dict):
-                if "index" in item:
-                    idx = int(item["index"])
-                if item.get("score") is not None:
-                    try:
-                        score = float(item["score"])
-                    except Exception:
-                        score = None
-            if idx is not None and 0 <= idx < n_docs:
-                ranked.append((idx, score))
-        if ranked and all(s is not None for _, s in ranked):
-            ranked.sort(key=lambda x: x[1], reverse=True)
-        return ranked
-
     def load(
         self,
         path_or_paths: Union[str, Path, List[Union[str, Path]]],
@@ -564,10 +450,10 @@ class Collection:
         query: str,
         collection_name: Optional[str] = None,
     ) -> List[Dict]:
-        """Search the knowledge store for documents relevant to the query, optionally reranking with an LLM.
+        """Search the knowledge store for documents relevant to the query.
 
-        Performs vector search in the specified collection and, if configured, reranks top candidates using
-        the LLM reranker. Results include text, metadata, vector score, and optional rerank_score.
+        Performs vector search in the specified collection.
+        Results include text, metadata, vector score.
 
         Args:
             query (str): Query string to search for.
@@ -579,7 +465,6 @@ class Collection:
                 - 'metadata' (dict): Associated metadata for the chunk.
                 - 'score' (float): Similarity score from the vector store (heuristic).
 
-                - 'rerank_score' (Optional[float]): Optional reranker relevance score when reranking is enabled.
         """
         collection_name = collection_name or self.default_collection
         store = self.collections.get(collection_name)
@@ -590,41 +475,7 @@ class Collection:
             query, k=self.retrieval_top_k
         )  # [(text, meta, sim_score), ...]
 
-        if not self._rerank_fn:
-            return [{"text": t, "metadata": m, "score": s} for t, m, s in hits]
-
-        try:
-            docs = [t for t, _, _ in hits]
-            metas = [m for _, m, _ in hits]
-            top_n = min(len(docs), self.rerank_top_k or len(docs))
-
-            raw = self._rerank_fn(query, docs, metas, top_n=top_n)
-            ranked = self._normalize_rerank_result(raw, n_docs=len(docs))
-            if not ranked:
-                self.logger.debug(
-                    "Reranker returned empty/invalid result; fallback to vector order."
-                )
-                return [{"text": t, "metadata": m, "score": s} for t, m, s in hits]
-
-            used = set()
-            reranked_results: List[Dict] = []
-            for idx, rscore in ranked:
-                t, m, s = hits[idx]
-                reranked_results.append(
-                    {"text": t, "metadata": m, "score": s, "rerank_score": rscore}
-                )
-                used.add(idx)
-
-            for i, (t, m, s) in enumerate(hits):
-                if len(reranked_results) >= self.rerank_top_k:
-                    break
-                if i not in used:
-                    reranked_results.append({"text": t, "metadata": m, "score": s})
-
-            return reranked_results[: self.retrieval_top_k]
-        except Exception as e:
-            self.logger.warning(f"Reranking failed: {e}. Fallback to vector order.")
-            return [{"text": t, "metadata": m, "score": s} for t, m, s in hits]
+        return [{"text": t, "metadata": m, "score": s} for t, m, s in hits]
 
 
 class Agent:
@@ -699,12 +550,12 @@ class Agent:
         - Creates the internal agents.Agent instance with provided settings.
 
         Args:
-            base_url (str, optional): Base URL for the OpenAI client. Defaults to environment variable LITELLM_BASE_URL if not set.
-            api_key (str, optional): API key for the OpenAI client. Defaults to environment variable LITELLM_API_KEY if not set.
+            base_url (str, optional): Base URL for the OpenAI client. Defaults to environment variable OPENAI_BASE_URL if not set.
+            api_key (str, optional): API key for the OpenAI client. Defaults to environment variable OPENAI_API_KEY if not set.
             name (str): Name of the agent wrapper and underlying agent.
             log_file (str, optional): Path to file for logging output.
             log_level (str): Logging verbosity level (e.g. "INFO", "DEBUG").
-            model_name (str, optional): Name of the model to use. Defaults to environment variable LITELLM_MODEL_NAME if not set.
+            model_name (str, optional): Name of the model to use. Defaults to environment variable OPENAI_MODEL_NAME if not set.
             model_settings (dict, optional): Additional model configuration forwarded to agents.ModelSettings.
             instructions (str): High-level instructions for the underlying agent.
             preset_prompts (dict, optional): Dictionary of preset prompts for common tasks.
@@ -726,6 +577,14 @@ class Agent:
             None
         """
         dotenv.load_dotenv()
+        self._oai_async = openai.AsyncOpenAI(
+            base_url=base_url or os.getenv("OPENAI_BASE_URL"),
+            api_key=api_key or os.getenv("OPENAI_API_KEY"),
+        )
+        agents.set_default_openai_client(
+            client=self._oai_async,
+            use_for_tracing=not trace_disabled,
+        )
         agents.set_default_openai_api(api=default_openai_api)
         agents.set_tracing_disabled(disabled=trace_disabled)
         self.logger = setup_logger(name, file=log_file, level=log_level)
@@ -752,14 +611,6 @@ class Agent:
             else:
                 self.logger.warning("tools must be agents.Tool or callable instances")
 
-        self.model = LitellmModel(
-            base_url=base_url
-            or os.getenv("LITELLM_BASE_URL")
-            or "https://api.openai.com/v1",
-            api_key=api_key or os.getenv("LITELLM_API_KEY"),
-            model=model_name or os.getenv("LITELLM_MODEL_NAME"),
-        )
-
         model_settings = model_settings or dict()
         if isinstance(model_settings, dict):
             model_settings.update({"include_usage": True})
@@ -784,7 +635,7 @@ class Agent:
             tools=self.function_tools,
             tool_use_behavior=tool_use_behavior,
             handoffs=self.handoff_agents,
-            model=self.model,
+            model=model_name or os.getenv("OPENAI_MODEL_NAME") or "gpt-5",
             model_settings=self.model_settings,
             input_guardrails=input_guardrails or list(),
             output_guardrails=output_guardrails or list(),
