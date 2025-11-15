@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import uuid
+import threading
 from pathlib import Path
 from typing import (
     Dict,
@@ -743,7 +744,7 @@ class Agent:
             tool_name=tool_name, tool_description=tool_description
         )
 
-    def export_conversation(self, output_file: str, limit: int = None):
+    def export_conversation(self, session_id: str, output_file: str, limit: int = None):
         """
         Export an SQLite session's conversation history to a JSON file.
 
@@ -756,12 +757,12 @@ class Agent:
         """
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(
-                self.get_conversation(limit),
+                self.get_conversation(session_id, limit),
                 f,
                 indent=2,
             )
 
-    def get_conversation(self, limit: int = None):
+    def get_conversation(self, session_id: str, limit: int = None):
         """
         Retrieve the conversation history for a given SQLite session.
 
@@ -771,7 +772,66 @@ class Agent:
         Returns:
             List[Dict]: List of conversation items in the session.
         """
-        return asyncio.run(self.session.get_items(limit))
+        session = agents.SQLiteSession(
+            session_id=session_id or uuid.uuid4().hex,
+            db_path=self.session_db,
+        )
+        conn = session._get_connection()
+        print(session_id, session.session_id)
+        with session._lock if session._is_memory_db else threading.Lock():
+            if limit is None:
+                # Fetch all items in chronological order
+                cursor = conn.execute(
+                    f"""
+                    SELECT message_data FROM {session.messages_table}
+                    WHERE session_id = ?
+                    ORDER BY created_at ASC
+                """,
+                    (session.session_id,),
+                )
+            else:
+                # Fetch the latest N items in chronological order
+                cursor = conn.execute(
+                    f"""
+                    SELECT message_data FROM {session.messages_table}
+                    WHERE session_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (session.session_id, limit),
+                )
+
+            rows = cursor.fetchall()
+
+            # Reverse to get chronological order when using DESC
+            if limit is not None:
+                rows = list(reversed(rows))
+
+            items = []
+            for (message_data,) in rows:
+                try:
+                    item = json.loads(message_data)
+                    items.append(item)
+                except json.JSONDecodeError:
+                    # Skip invalid JSON entries
+                    continue
+        return items
+
+    def get_all_conversations(self):
+        session = agents.SQLiteSession(
+            session_id=uuid.uuid4().hex,
+            db_path=self.session_db,
+        )
+        conn = session._get_connection()
+        with session._lock if session._is_memory_db else threading.Lock():
+            cursor = conn.execute(
+                f"""
+                SELECT session_id FROM {session.sessions_table}
+                ORDER BY created_at ASC
+            """,
+            )
+            rows = cursor.fetchall()
+        return [r[0] for r in rows]
 
     async def stream(
         self,
@@ -913,6 +973,8 @@ class Agent:
             None
         """
 
+        session_id = session_id or uuid.uuid4().hex
+        print(session_id)
         events = self.stream(
             prompt,
             use_knowledge=use_knowledge,
@@ -945,6 +1007,8 @@ class Agent:
                 else:
                     pass
 
+        return self.get_conversation(session_id=session_id)
+
     def run_streamed_sync(
         self,
         prompt: str,
@@ -965,7 +1029,7 @@ class Agent:
         Returns:
             None
         """
-        asyncio.run(
+        return asyncio.run(
             self.run_streamed(
                 prompt=prompt,
                 use_knowledge=use_knowledge,

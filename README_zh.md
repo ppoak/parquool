@@ -35,7 +35,9 @@ pip install "parquool[websearch]"
 ```
 
 
-## 快速开始 — DuckParquet
+## 快速开始
+
+### DuckParquet
 
 下面演示最常见的使用场景：创建 DuckParquet，查询、upsert、update 和 delete。
 
@@ -61,7 +63,7 @@ dp.update(set_map={'value': 0}, where='value < 0')
 dp.delete(where="id = 3")
 ```
 
-## 主要类与方法概览
+#### 主要类与方法概览
 
 - DuckParquet(dataset_path, name=None, db_path=None, threads=None)
   - select(...): 通用查询接口，支持 where, group_by, order_by, limit, distinct 等。
@@ -86,10 +88,22 @@ dp.delete(where="id = 3")
   - 可通过环境变量配置：NOTIFY_TASK_SENDER、NOTIFY_TASK_PASSWORD、NOTIFY_TASK_RECEIVER、NOTIFY_TASK_SMTP_SERVER、NOTIFY_TASK_SMTP_PORT、NOTIFY_TASK_CC。
   - 注意：源码中有一处备注提到 smtp_port 可能被错误赋值，使用前请验证配置。
 
+- generate_usage(target: object, output_path: Optional[str] = None, *, include_private: bool = False, include_inherited: bool = False, include_properties: bool = True, include_methods: bool = True, method_kinds: tuple[str, ...] = ("instance", "class", "static"), method_include: Optional[list[str]] = None, method_exclude: Optional[list[str]] = None, attribute_include: Optional[list[str]] = None, attribute_exclude: Optional[list[str]] = None, sort_methods: Literal["name", "kind", "none"] = "name", render_tables: bool = True, include_signature: bool = True, include_sections: Optional[Literal["summary", "description", "attributes", "methods", "parameters", "returns", "raises", "examples",]] = None, heading_level: int = 2 ) -> str
+    - 可以在传入类或函数后，自动生成函数类的说明文档，提供了各种用于精细控制的参数
+
+- def google_search(query: str, location: Literal["China", "United States", "Germany", "France"] = None, country: str = None, language: str = None, to_be_searched: str = None, start: str = None, num: str = None,
+)
+    - Google搜索函数，输入搜索关键词以及相关搜索参数，可以得到搜索结果合集
+
+- def read_url(url_or_urls: Union[str, List], engine: Literal["direct", "browser"] = None, return_format: Literal["markdown", "html", "text", "screeshot"] = None, with_links_summary: Literal["all", "true"] = "true", with_image_summary: Literal["all", "true"] = "true", retain_image: bool = False, do_not_track: bool = True, set_cookie: str = None, max_length_each: int = 100000,
+)
+    - 页面内容阅读器，通过调用jina接口将网页页面转化为易于AI处理的markdown格式
+
+
 ### Agent 封装 — Agent
 
-BaseAgent 基于 openai-agents 封装常见初始化逻辑：
-- 初始化会读取环境变量（LITELLM_BASE_URL、LITELLM_API_KEY、LITELLM_MODEL_NAME 等）并配置默认 litellm 客户端。
+Parquool 基于 openai-agents 封装常见初始化逻辑：
+- 初始化会读取环境变量（OPENAI_BASE_URL、OPENAI_API_KEY、OPENAI_MODEL_NAME 等）并配置默认 litellm 客户端。
 - 提供 run/run_sync/run_streamed/cli 等方法用于运行 prompt、流式输出和交互式 CLI。
 
 简单示例：
@@ -100,8 +114,14 @@ from parquool import Agent
 agent = Agent(name='myagent')
 # 同步运行（阻塞）
 res = agent.run_sync('Summarize the following data...')
+# 同步运行（流式输出）
+res = agent.run_streamd_sync('Hi')
 print(res)
 ```
+
+使用run/run_sync接口返回的为openai_agents中的RunResult类，可通过res.final_output获取到最终输出的字符串，使用run_streamed/run_stream_sync接口获取到的结果是一个列表，里面以字典形式存储对话的信息，包括context、role等字段。
+
+另外，还可以通过agent.get_all_conversations获取到当前已经进行的所有对话session_id，agent.get_conversation(session_id)获取到指定session_id的所有对话数据，agent.export_conversation将指定session_id对话存入json。
 
 使用 Collection 知识库关联知识库内容搜索
 
@@ -175,9 +195,9 @@ if prompt := st.chat_input("What's up?"):
 
 建议在项目根目录创建 .env 文件以便于配置：
 
-- LITELLM_BASE_URL: OpenAI 兼容服务的基础 URL（可选）
-- LITELLM_API_KEY: OpenAI API key
-- LITELLM_MODEL_NAME: 默认使用的模型名
+- OPENAI_BASE_URL: OpenAI 兼容服务的基础 URL（可选）
+- OPENAI_API_KEY: OpenAI API key
+- OPENAI_MODEL_NAME: 默认使用的模型名
 - NOTIFY_TASK_*: notify_task 装饰器相关的邮件配置
 
 ## 贡献
