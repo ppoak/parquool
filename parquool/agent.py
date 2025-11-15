@@ -536,7 +536,6 @@ class Agent:
         collection: Collection = None,
         rag_max_context: int = 6000,
         rag_prompt_template: str = None,
-        session_id: str = None,
         session_db: Union[Path, str] = ":memory:",
     ):
         """
@@ -570,7 +569,6 @@ class Agent:
             collection (Collection, optional): Knowledge collection for retrieval-augmented generation (RAG).
             rag_max_context (int): Maximum total context length for RAG augmentation.
             rag_prompt_template (str, optional): Template string for prompt augmentation with retrieved context.
-            session_id (str, optional): Session ID, if not specified, a uuid-4 string will be applied.
             session_db (str, optional): Path to session database file (sqlite), if not specified, in-memory database will be used.
 
         Returns:
@@ -648,11 +646,7 @@ class Agent:
             "Question:\n{question}"
         )
 
-        self.session_id = session_id or uuid.uuid4().hex
         self.session_db = session_db
-        self.session = agents.SQLiteSession(
-            session_id=self.session_id, db_path=self.session_db
-        )
 
     # ----------------- Internal helpers -----------------
 
@@ -784,6 +778,7 @@ class Agent:
         prompt: str,
         use_knowledge: Optional[bool] = None,
         collection_name: Optional[str] = None,
+        session_id: str = None,
     ) -> AsyncIterator:
         """
         Asynchronously iterator to run a prompt and process streaming response events.
@@ -794,6 +789,7 @@ class Agent:
             prompt (str): Prompt text to execute.
             use_knowledge (Optional[bool], optional): Whether to augment prompt with knowledge base context.
             collection_name (Optional[str], optional): Name of the knowledge collection to use.
+            session_id (str, optional): Session ID, if not specified, a uuid-4 string will be applied.
 
         Returns:
             None
@@ -805,10 +801,14 @@ class Agent:
             collection_name=collection_name,
         )
 
+        session = agents.SQLiteSession(
+            session_id=session_id or uuid.uuid4().hex,
+            db_path=self.session_db,
+        )
         result = agents.Runner.run_streamed(
             self.agent,
             prompt_to_run,
-            session=self.session,
+            session=session,
         )
         async for event in result.stream_events():
             yield event
@@ -820,6 +820,7 @@ class Agent:
         prompt: str,
         use_knowledge: Optional[bool] = None,
         collection_name: Optional[str] = None,
+        session_id: str = None,
     ):
         """
         Synchronously run a prompt using the agent inside an SQLite-backed session.
@@ -830,6 +831,7 @@ class Agent:
             prompt (str): Text prompt to run.
             use_knowledge (Optional[bool], optional): Whether to utilize knowledge base augmentation.
             collection_name (Optional[str], optional): Name of the knowledge collection to query.
+            session_id (str, optional): Session ID, if not specified, a uuid-4 string will be applied.
 
         Returns:
             Any: Result from agents.Runner.run execution (implementation-specific).
@@ -840,10 +842,14 @@ class Agent:
             use_knowledge=use_knowledge,
             collection_name=collection_name,
         )
+        session = agents.SQLiteSession(
+            session_id=session_id or uuid.uuid4().hex,
+            db_path=self.session_db,
+        )
         return agents.Runner.run(
             self.agent,
             prompt_to_run,
-            session=self.session,
+            session=session,
         )
 
     def run_sync(
@@ -851,6 +857,7 @@ class Agent:
         prompt: str,
         use_knowledge: Optional[bool] = None,
         collection_name: Optional[str] = None,
+        session_id: str = None,
     ):
         """
         Blocking call to run a prompt synchronously using the agent.
@@ -861,6 +868,7 @@ class Agent:
             prompt (str): Prompt text to execute.
             use_knowledge (Optional[bool], optional): Flag to enable prompt augmentation.
             collection_name (Optional[str], optional): Knowledge collection name to use for augmentation.
+            session_id (str, optional): Session ID, if not specified, a uuid-4 string will be applied.
 
         Returns:
             Any: Result returned by agents.Runner.run_sync (implementation-specific).
@@ -871,10 +879,14 @@ class Agent:
             use_knowledge=use_knowledge,
             collection_name=collection_name,
         )
+        session = agents.SQLiteSession(
+            session_id=session_id or uuid.uuid4().hex,
+            db_path=self.session_db,
+        )
         return agents.Runner.run_sync(
             self.agent,
             prompt_to_run,
-            session=self.session,
+            session=session,
         )
 
     async def run_streamed(
@@ -882,6 +894,7 @@ class Agent:
         prompt: str,
         use_knowledge: Optional[bool] = None,
         collection_name: Optional[str] = None,
+        session_id: str = None,
     ):
         """
         Run a prompt with the agent and process the output in a streaming fashion asynchronously.
@@ -894,6 +907,7 @@ class Agent:
             db_path (str, optional): Path to SQLite DB file; defaults to ":memory:".
             use_knowledge (Optional[bool], optional): Whether to augment prompt from knowledge base.
             collection_name (Optional[str], optional): Name of the knowledge collection.
+            session_id (str, optional): Session ID, if not specified, a uuid-4 string will be applied.
 
         Returns:
             None
@@ -903,6 +917,7 @@ class Agent:
             prompt,
             use_knowledge=use_knowledge,
             collection_name=collection_name,
+            session_id=session_id,
         )
         async for event in events:
             # We'll print streaming delta if available
@@ -935,16 +950,17 @@ class Agent:
         prompt: str,
         use_knowledge: Optional[bool] = None,
         collection_name: Optional[str] = None,
+        session_id: str = None,
     ):
         """
         Run a prompt with the agent and process the output in a streaming fashion synchronously.
 
         Args:
             prompt (str): Prompt text to run.
-            session_id (str, optional): Optional conversation session ID; generates new UUID if None.
             db_path (str, optional): Path to SQLite DB file; defaults to ":memory:".
             use_knowledge (Optional[bool], optional): Whether to augment prompt from knowledge base.
             collection_name (Optional[str], optional): Name of the knowledge collection.
+            session_id (str, optional): Optional conversation session ID; generates new UUID if None.
 
         Returns:
             None
@@ -954,5 +970,6 @@ class Agent:
                 prompt=prompt,
                 use_knowledge=use_knowledge,
                 collection_name=collection_name,
+                session_id=session_id,
             )
         )
