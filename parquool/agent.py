@@ -895,7 +895,7 @@ class Agent:
         Returns:
             Any: Result from agents.Runner.run execution (implementation-specific).
         """
-        use_knowledge = True if self.collection else False
+        use_knowledge = use_knowledge or True if self.collection else False
         prompt_to_run = self._maybe_augment_prompt(
             prompt=prompt,
             use_knowledge=use_knowledge,
@@ -905,7 +905,7 @@ class Agent:
             session_id=session_id or uuid.uuid4().hex,
             db_path=self.session_db,
         )
-        return agents.Runner.run(
+        return await agents.Runner.run(
             self.agent,
             prompt_to_run,
             session=session,
@@ -932,7 +932,7 @@ class Agent:
         Returns:
             Any: Result returned by agents.Runner.run_sync (implementation-specific).
         """
-        use_knowledge = True if self.collection else False
+        use_knowledge = use_knowledge or (True if self.collection else False)
         prompt_to_run = self._maybe_augment_prompt(
             prompt=prompt,
             use_knowledge=use_knowledge,
@@ -973,13 +973,23 @@ class Agent:
         """
 
         session_id = session_id or uuid.uuid4().hex
-        events = self.stream(
-            prompt,
+        use_knowledge = use_knowledge or (True if self.collection else False)
+        prompt_to_run = self._maybe_augment_prompt(
+            prompt=prompt,
             use_knowledge=use_knowledge,
             collection_name=collection_name,
-            session_id=session_id,
         )
-        async for event in events:
+
+        session = agents.SQLiteSession(
+            session_id=session_id or uuid.uuid4().hex,
+            db_path=self.session_db,
+        )
+        result = agents.Runner.run_streamed(
+            self.agent,
+            prompt_to_run,
+            session=session,
+        )
+        async for event in result.stream_events():
             # We'll print streaming delta if available
             if event.type == "raw_response_event" and isinstance(
                 event.data, ResponseTextDeltaEvent
@@ -1005,7 +1015,7 @@ class Agent:
                 else:
                     pass
 
-        return self.get_conversation(session_id=session_id)
+        return result
 
     def run_streamed_sync(
         self,
