@@ -777,7 +777,6 @@ class Agent:
             db_path=self.session_db,
         )
         conn = session._get_connection()
-        print(session_id, session.session_id)
         with session._lock if session._is_memory_db else threading.Lock():
             if limit is None:
                 # Fetch all items in chronological order
@@ -974,7 +973,6 @@ class Agent:
         """
 
         session_id = session_id or uuid.uuid4().hex
-        print(session_id)
         events = self.stream(
             prompt,
             use_knowledge=use_knowledge,
