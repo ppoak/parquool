@@ -8,7 +8,8 @@ from .util import (
 )
 
 from .storage import (
-    DuckParquet,
+    DuckTable,
+    DuckPQ,
 )
 
 from .agent import (
