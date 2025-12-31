@@ -1,6 +1,7 @@
 import re
 import shutil
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import (
     Any,
@@ -534,6 +535,65 @@ class DuckTable:
         else:
             self._upsert_existing(df, keys, partition_by)
 
+    def compact(
+        self,
+        compression: str = "zstd",
+        max_workers: int = 8,
+        engine: str = "pyarrow",
+    ) -> List[str]:
+        """Compact partition directories with multiple parquet files into single parquet file."""
+        if not self.root_path.exists():
+            return []
+
+        targets: List[Path] = []
+        for part_dir in (p for p in self.root_path.rglob("*") if p.is_dir()):
+            if len(list(part_dir.glob("*.parquet"))) > 1:
+                targets.append(part_dir)
+
+        max_workers = min(int(max_workers), max(1, len(targets)))
+
+        def _compact_one(part_dir: Path) -> str:
+            parquet_files = sorted(part_dir.glob("*.parquet"))
+            if len(parquet_files) <= 1:
+                return str(part_dir.relative_to(self.root_path))
+
+            tmpdir = self._local_tempdir(part_dir.parent, prefix="__compact_")
+            try:
+                dfs = [pd.read_parquet(p, engine=engine) for p in parquet_files]
+                df = pd.concat(dfs, ignore_index=True)
+
+                out_path = tmpdir / "data_0.parquet"
+                df.to_parquet(
+                    out_path, engine=engine, compression=compression, index=False
+                )
+
+                new_part = tmpdir / "newpart"
+                new_part.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(out_path), str(new_part / "data_0.parquet"))
+                self._atomic_replace_dir(new_part, part_dir)
+                return str(part_dir.relative_to(self.root_path))
+            finally:
+                if tmpdir.exists():
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+
+        compacted: List[str] = []
+        errors: List[Exception] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = [ex.submit(_compact_one, p) for p in targets]
+            for fut in as_completed(futs):
+                try:
+                    compacted.append(fut.result())
+                except Exception as e:
+                    errors.append(e)
+
+        if errors:
+            raise RuntimeError(
+                f"compact failed for {len(errors)} partitions"
+            ) from errors[0]
+
+        self.refresh()
+        return compacted
+
 
 class DuckPQ:
     """Database-like manager for a directory of Hive-partitioned Parquet tables.
@@ -762,6 +822,20 @@ class DuckPQ:
             limit=limit,
             offset=offset,
             distinct=distinct,
+        )
+
+    def compact(
+        self,
+        table: str,
+        compression: str = "zstd",
+        max_workers: int = 8,
+        engine: str = "pyarrow",
+    ) -> List[str]:
+        dp = self._get_or_create_table(table)
+        return dp.compact(
+            compression=compression,
+            max_workers=max_workers,
+            engine=engine,
         )
 
     # ------------------------------------------------------------------ #
