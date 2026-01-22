@@ -646,7 +646,11 @@ class Agent:
             "Context:\n{context}\n\n"
             "Question:\n{question}"
         )
-
+        # Reuse one SQLiteSession/connection for in-memory DB
+        self.session = agents.SQLiteSession(
+            session_id=uuid.uuid4().hex,
+            db_path=session_db,
+        )
         self.session_db = session_db
 
     # ----------------- Internal helpers -----------------
@@ -860,14 +864,14 @@ class Agent:
             collection_name=collection_name,
         )
 
-        session = agents.SQLiteSession(
-            session_id=session_id or uuid.uuid4().hex,
-            db_path=self.session_db,
-        )
+        # switch session id on the reused session (one connection)
+        if session_id is not None:
+            self.session.session_id = session_id
+
         result = agents.Runner.run_streamed(
             self.agent,
             prompt_to_run,
-            session=session,
+            session=self.session,
         )
         async for event in result.stream_events():
             yield event
@@ -901,14 +905,14 @@ class Agent:
             use_knowledge=use_knowledge,
             collection_name=collection_name,
         )
-        session = agents.SQLiteSession(
-            session_id=session_id or uuid.uuid4().hex,
-            db_path=self.session_db,
-        )
+        # switch session id on the reused session (one connection)
+        if session_id is not None:
+            self.session.session_id = session_id
+
         return await agents.Runner.run(
             self.agent,
             prompt_to_run,
-            session=session,
+            session=self.session,
         )
 
     def run_sync(
@@ -938,14 +942,14 @@ class Agent:
             use_knowledge=use_knowledge,
             collection_name=collection_name,
         )
-        session = agents.SQLiteSession(
-            session_id=session_id or uuid.uuid4().hex,
-            db_path=self.session_db,
-        )
+        # switch session id on the reused session (one connection)
+        if session_id is not None:
+            self.session.session_id = session_id
+
         return agents.Runner.run_sync(
             self.agent,
             prompt_to_run,
-            session=session,
+            session=self.session,
         )
 
     async def run_streamed(
@@ -980,14 +984,14 @@ class Agent:
             collection_name=collection_name,
         )
 
-        session = agents.SQLiteSession(
-            session_id=session_id or uuid.uuid4().hex,
-            db_path=self.session_db,
-        )
+        # switch session id on the reused session (one connection)
+        if session_id is not None:
+            self.session.session_id = session_id
+
         result = agents.Runner.run_streamed(
             self.agent,
             prompt_to_run,
-            session=session,
+            session=self.session,
         )
         async for event in result.stream_events():
             # We'll print streaming delta if available
