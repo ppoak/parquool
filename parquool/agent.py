@@ -776,32 +776,28 @@ class Agent:
         Returns:
             List[Dict]: List of conversation items in the session.
         """
-        session = agents.SQLiteSession(
-            session_id=session_id or uuid.uuid4().hex,
-            db_path=self.session_db,
-        )
-        conn = session._get_connection()
-        with session._lock if session._is_memory_db else threading.Lock():
+        conn = self.session._get_connection()
+        with self.session._lock if self.session._is_memory_db else threading.Lock():
             if limit is None:
                 # Fetch all items in chronological order
                 cursor = conn.execute(
                     f"""
-                    SELECT message_data FROM {session.messages_table}
+                    SELECT message_data FROM {self.session.messages_table}
                     WHERE session_id = ?
                     ORDER BY created_at ASC
                 """,
-                    (session.session_id,),
+                    (self.session.session_id,),
                 )
             else:
                 # Fetch the latest N items in chronological order
                 cursor = conn.execute(
                     f"""
-                    SELECT message_data FROM {session.messages_table}
+                    SELECT message_data FROM {self.session.messages_table}
                     WHERE session_id = ?
                     ORDER BY created_at DESC
                     LIMIT ?
                     """,
-                    (session.session_id, limit),
+                    (self.session.session_id, limit),
                 )
 
             rows = cursor.fetchall()
@@ -821,15 +817,11 @@ class Agent:
         return items
 
     def get_all_conversations(self):
-        session = agents.SQLiteSession(
-            session_id=uuid.uuid4().hex,
-            db_path=self.session_db,
-        )
-        conn = session._get_connection()
-        with session._lock if session._is_memory_db else threading.Lock():
+        conn = self.session._get_connection()
+        with self.session._lock if self.session._is_memory_db else threading.Lock():
             cursor = conn.execute(
                 f"""
-                SELECT session_id FROM {session.sessions_table}
+                SELECT session_id FROM {self.session.sessions_table}
                 ORDER BY created_at ASC
             """,
             )
