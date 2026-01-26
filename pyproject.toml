@@ -10,10 +10,10 @@ readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
     { name = "ppoak", email = "ppoak@foxmail.com" }
 ]
+license = "MIT"
 keywords = ["quant", "database", "parquet", "finance"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 requires-python = ">=3.10"
