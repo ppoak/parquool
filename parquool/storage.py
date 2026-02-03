@@ -317,7 +317,7 @@ class DuckTable:
             except Exception:
                 pass
 
-    def drop_view(self):
+    def drop(self):
         """Drop the underlying DuckDB view, if it exists."""
         view_ident = DuckTable._quote_ident(self.view_name)
         try:
@@ -352,7 +352,7 @@ class DuckTable:
             self._create_or_replace_view()
         else:
             # If no parquet files, it's fine to just drop the view.
-            self.drop_view()
+            self.drop()
 
     def execute(
         self, sql: str, params: Optional[Sequence[Any]] = None
@@ -754,6 +754,63 @@ class DuckPQ:
                 database=self.con,
             )
             self.tables[table_name] = dp
+
+    def attach(
+        self,
+        name: str,
+        df: pd.DataFrame,
+        replace: bool = True,
+        materialize: bool = False,
+    ) -> None:
+        """Register a pandas DataFrame as a DuckDB relation.
+
+        This method exposes a pandas DataFrame to the underlying DuckDB
+        connection, allowing it to be queried using SQL. Depending on
+        `materialize`, the DataFrame can be registered as:
+
+        - a DuckDB view / relation (via `con.register`), or
+        - a temporary DuckDB table (via `CREATE TEMP TABLE AS`).
+
+        The registered object lives within the lifetime of the DuckDB
+        connection and does not persist to disk unless explicitly copied
+        out later.
+
+        Args:
+            name: Name of the DuckDB view or table to register.
+            df: pandas DataFrame to expose to DuckDB.
+            replace: Whether to drop an existing view or table with
+                the same name before registration.
+            materialize: If True, create a temporary DuckDB table
+                instead of a view / relation.
+
+        Returns:
+            None
+        """
+        ident = DuckTable._quote_ident(name)
+
+        # Drop existing object if requested
+        if replace:
+            try:
+                self.con.execute(f"DROP VIEW IF EXISTS {ident}")
+                self.con.execute(f"DROP TABLE IF EXISTS {ident}")
+            except Exception:
+                # Ignore failures caused by missing objects
+                pass
+
+        if materialize:
+            # Register DataFrame under a temporary name, then materialize
+            # it into a DuckDB TEMP TABLE.
+            tmp_name = "__tmp_df__"
+            self.con.register(tmp_name, df)
+            try:
+                self.con.execute(
+                    f"CREATE TEMP TABLE {ident} AS SELECT * FROM {tmp_name}"
+                )
+            finally:
+                self.con.unregister(tmp_name)
+        else:
+            # Register DataFrame directly as a DuckDB relation (view-like)
+            self.con.register(name, df)
 
     # ------------------------------------------------------------------ #
     # Public API: delegate to DuckTable for single-table operations
