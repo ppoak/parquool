@@ -114,17 +114,18 @@ class Collection:
     It centralizes configuration for embedding, vector DB path, chunking behavior, and logging.
 
     Attributes:
-        default_collection (str): Default collection name used when none is provided to load/search methods.
-        embedding_model (Optional[str]): Name of the embedding model used to compute embeddings.
-        chunk_size (int): Maximum number of characters per chunk when splitting documents.
-        chunk_overlap (int): Number of characters overlapping between adjacent chunks.
-        retrieval_top_k (int): Default number of top vector search results to return.
-        _vector_db_path (str): Filesystem path where the Chroma persistent database is stored.
-        _chroma (chromadb.PersistentClient): Underlying persistent Chroma client instance.
-        collections (Dict[str, _ChromaVectorStore]): In-memory map of collection name to _ChromaVectorStore wrappers.
-        logger: Logger instance used for informational and error messages.
+        default_collection (str): Default collection name to use for loading and searching knowledge.
+        base_url (Optional[str]): Base URL for the OpenAI-compatible API. If None, read from OPENAI_BASE_URL env.
+        api_key (Optional[str]): API key for the OpenAI-compatible API. If None, read from OPENAI_API_KEY env.
+        embedding_model (Optional[str]): Embedding model name. If None, read from OPENAI_EMBEDDING_MODEL env.
+        chunk_size (int): Maximum number of characters per text chunk.
+        chunk_overlap (int): Overlap size in characters between adjacent chunks.
+        retrieval_top_k (int): Number of top vector search results to return by default.
+        vector_db_path (Optional[str]): Filesystem path to persist Chroma DB. If None, read from AGENT_VECTOR_DB_PATH env or default '.knowledge'.
+        log_level (str): Logging level name.
+        log_file (Optional[Union[str, Path]]): Optional path to a log file.
 
-    Example:
+    Examples:
         >>> col = Collection(default_collection="notes", embedding_model="text-embedding-3-small", vector_db_path=".kb")
         >>> col.load_knowledge("/path/to/docs")
         >>> results = col.search_knowledge("How to configure the system?")
@@ -498,19 +499,30 @@ class Agent:
       - Offer run, run_sync, run_streamed, and stream interfaces that persist conversations to SQLite sessions.
 
     Attributes:
-        logger (logging.Logger): Logger configured for this wrapper.
-        agent (agents.Agent): Underlying agent instance that performs reasoning, tool calls, and messaging.
-        model (LitellmModel): Model client used by the underlying agent.
-        model_settings (agents.ModelSettings): Model settings forwarded to the agent.
-        tools (dict): Mapping of tool name to callable for convenience tools.
-        function_tools (List[agents.Tool]): List of agents-compatible function tools registered on the agent.
-        handoff_agents (List[agents.Agent]): List of agents to which the wrapper can hand off control.
-        preset_prompts (dict): Optional preset prompts for common tasks.
-        collection (Collection | None): Optional knowledge collection used for RAG augmentation.
-        rag_prompt_template (str): Template used to format augmented prompts with retrieved context.
-        rag_max_context (int): Maximum total length of concatenated context used for RAG.
+        base_url (str, optional): Base URL for the OpenAI client. Defaults to environment variable OPENAI_BASE_URL if not set.
+        api_key (str, optional): API key for the OpenAI client. Defaults to environment variable OPENAI_API_KEY if not set.
+        name (str): Name of the agent wrapper and underlying agent.
+        log_file (str, optional): Path to file for logging output.
+        log_level (str): Logging verbosity level (e.g. "INFO", "DEBUG").
+        model_name (str, optional): Name of the model to use. Defaults to environment variable OPENAI_MODEL_NAME if not set.
+        model_settings (dict, optional): Additional model configuration forwarded to agents.ModelSettings.
+        instructions (str): High-level instructions for the underlying agent.
+        preset_prompts (dict, optional): Dictionary of preset prompts for common tasks.
+        tools (List[agents.FunctionTool], optional): List of tool descriptors or callables to add to the agent.
+        tool_use_behavior (str): Strategy for how tools are used by the agent.
+        handoffs (List[agents.Agent], optional): List of handoff agents.
+        output_type (str, optional): Optional output type annotation for the agent.
+        input_guardrails (List[agents.InputGuardrail], optional): List of input guardrails to enforce.
+        output_guardrails (List[agents.OutputGuardrail], optional): List of output guardrails to enforce.
+        default_openai_api (str): Default OpenAI API endpoint to use (e.g. "chat_completions").
+        trace_disabled (bool): If True, disables tracing features.
+        collection (Collection, optional): Knowledge collection for retrieval-augmented generation (RAG).
+        rag_max_context (int): Maximum total context length for RAG augmentation.
+        rag_prompt_template (str, optional): Template string for prompt augmentation with retrieved context.
+        session_db (str, optional): Path to session database file (sqlite), if not specified, in-memory database will be used.
 
-    Example:
+    Examples:
+        >>> # Set environment variable OPENAI_BASE_URL, OPENAI_API_KEY
         >>> agent = Agent(model_name="gpt-4", log_level="DEBUG", collection=my_collection)
         >>> result = agent.run("Summarize the conversation.")
     """
@@ -731,7 +743,7 @@ class Agent:
 
     # ----------------- Public interfaces -----------------
 
-    def as_tool(self, tool_name: str, tool_description: str):
+    def as_tool(self, tool_name: str, tool_description: str) -> agents.Tool:
         """
         Expose this agent as a tool descriptor compatible with agents.Tool.
 
@@ -766,7 +778,7 @@ class Agent:
                 indent=2,
             )
 
-    def get_conversation(self, session_id: str, limit: int = None):
+    def get_conversation(self, session_id: str, limit: int = None) -> List:
         """
         Retrieve the conversation history for a given SQLite session.
 
@@ -816,7 +828,7 @@ class Agent:
                     continue
         return items
 
-    def get_all_conversations(self):
+    def get_all_conversations(self) -> List:
         conn = self.session._get_connection()
         with self.session._lock if self.session._is_memory_db else threading.Lock():
             cursor = conn.execute(
@@ -847,7 +859,7 @@ class Agent:
             session_id (str, optional): Session ID, if not specified, a uuid-4 string will be applied.
 
         Returns:
-            None
+            AsyncIterator
         """
         use_knowledge = True if self.collection else False
         prompt_to_run = self._maybe_augment_prompt(
@@ -876,7 +888,7 @@ class Agent:
         use_knowledge: Optional[bool] = None,
         collection_name: Optional[str] = None,
         session_id: str = None,
-    ):
+    ) -> AsyncIterator:
         """
         Synchronously run a prompt using the agent inside an SQLite-backed session.
 
@@ -889,7 +901,7 @@ class Agent:
             session_id (str, optional): Session ID, if not specified, a uuid-4 string will be applied.
 
         Returns:
-            Any: Result from agents.Runner.run execution (implementation-specific).
+            agents.RunResult: Result from agents.Runner.run execution (implementation-specific).
         """
         use_knowledge = use_knowledge or True if self.collection else False
         prompt_to_run = self._maybe_augment_prompt(
@@ -913,7 +925,7 @@ class Agent:
         use_knowledge: Optional[bool] = None,
         collection_name: Optional[str] = None,
         session_id: str = None,
-    ):
+    ) -> agents.RunResult:
         """
         Blocking call to run a prompt synchronously using the agent.
 
@@ -926,7 +938,7 @@ class Agent:
             session_id (str, optional): Session ID, if not specified, a uuid-4 string will be applied.
 
         Returns:
-            Any: Result returned by agents.Runner.run_sync (implementation-specific).
+            agents.RunResult: Result returned by agents.Runner.run_sync (implementation-specific).
         """
         use_knowledge = use_knowledge or (True if self.collection else False)
         prompt_to_run = self._maybe_augment_prompt(
@@ -965,7 +977,7 @@ class Agent:
             session_id (str, optional): Session ID, if not specified, a uuid-4 string will be applied.
 
         Returns:
-            None
+            AsyncIterator
         """
 
         session_id = session_id or uuid.uuid4().hex
@@ -1019,7 +1031,7 @@ class Agent:
         use_knowledge: Optional[bool] = None,
         collection_name: Optional[str] = None,
         session_id: str = None,
-    ):
+    ) -> agents.RunResult:
         """
         Run a prompt with the agent and process the output in a streaming fashion synchronously.
 
@@ -1031,7 +1043,7 @@ class Agent:
             session_id (str, optional): Optional conversation session ID; generates new UUID if None.
 
         Returns:
-            None
+            agents.RunResult
         """
         return asyncio.run(
             self.run_streamed(

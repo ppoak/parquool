@@ -1,6 +1,6 @@
 # Parquool
 
-Parquool（项目名：parquool）是一个轻量级的 Python 库，提供对 parquet 数据集的 SQL 式查询、分区写入、行级 upsert/update/delete 等常用数据工程操作的便捷封装，并包含一些实用的工具函数（日志、HTTP 代理请求、任务通知装饰器）以及一个基于 openai-agents 的 Agent 包装器，与之配套的一个知识库管理工具 Collection 。
+Parquool（项目名：parquool）是一个轻量级的 Python 库，提供对 parquet 数据集的 SQL 式查询、分区写入等常用数据工程操作的便捷封装，并包含一些实用的工具函数（日志、HTTP 代理请求、任务通知装饰器）以及一个基于 openai-agents 的 Agent 包装器，与之配套的一个知识库管理工具 Collection 。
 
 该库旨在简化在本地或服务器上以 parquet 文件为数据存储时的常见数据管理场景，基于 DuckDB 提供高性能的 SQL 查询能力并支持将查询结果写回为分区 parquet 文件。 Agent 类提供了一套更为便捷操作、开箱即用的openai-agents接口。 Collection 提供了更为方便的知识库管理工具，能帮助用户最快的将知识库嵌入为向量数据库，方便 LLM 查询访问。
 
@@ -8,7 +8,6 @@ Parquool（项目名：parquool）是一个轻量级的 Python 库，提供对 p
 
 - 使用 DuckDB 的 parquet_scan 创建视图，像操作数据库表一样查询 parquet 数据。
 - 支持按主键的 upsert（合并）逻辑，支持分区写入（partition_by）。
-- 支持基于 SQL 的 update、delete 操作，并原子性替换目录内容以保证一致性。
 - 提供 pandas 友好的 select、query等方法。
 - 附带实用工具：可配置的 logger、带重试的 proxy_request、邮件通知任务装饰器 notify_task。
 - Openai Agents 集成的 Agent 类，方便用户定义自己的 Agent ，开箱即用。
@@ -195,6 +194,20 @@ if prompt := st.chat_input("What's up?"):
 - OPENAI_API_KEY: OpenAI API key
 - OPENAI_MODEL_NAME: 默认使用的模型名
 - NOTIFY_TASK_*: notify_task 装饰器相关的邮件配置
+
+### 详情
+
+1. [Agent](./doc/Agent.md)
+2. [Collection](./doc/Collection.md)
+3. [DuckTable](./doc/DuckTable.md)
+4. [DuckPQ](./doc/DuckPQ.md)
+5. [generate_usage](./doc/generate_usage.md)
+6. [google_search](./doc/google_search.md)
+7. [notify_task](./doc/notify_task.md)
+8. [proxy_request](./doc/proxy_request.md)
+9. [read_url](./doc/read_url.md)
+10. [setup_logger](./doc/setup_logger.md)
+
 
 ## 贡献
 

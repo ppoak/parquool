@@ -19,13 +19,14 @@ import pandas as pd
 class DuckTable:
     """Manage a directory of Parquet files through a DuckDB-backed view.
 
+    Descriptions:
     This class exposes a convenient API for querying and mutating a parquet
     dataset stored in a directory. Internally it creates a DuckDB connection
     (in-memory by default or a file DB if db_path is provided) and registers a
     CREATE OR REPLACE VIEW over parquet_scan(...) (with Hive-style partitioning
     enabled).
 
-    IMPORTANT:
+    Notices:
         - If you pass an existing DuckDBPyConnection in `con`, the connection
           is treated as *externally owned* and `DuckTable.close()` will NOT
           close it. This is used by DuckPQ to share a single connection across
@@ -33,7 +34,17 @@ class DuckTable:
         - If you pass `con` as a path or leave it as None, DuckTable will
           create and own its own DuckDB connection and close it on `close()`.
 
-    Typical usage:
+    Attributes:
+        root_path (str): Directory path that stores the parquet dataset.
+        name (Optional[str]): The view name. Defaults to directory basename.
+        create (bool): If True, create the directory if it doesn't exist.
+        con (Optional[Union[str, duckdb.DuckDBPyConnection]]): Either:
+            - DuckDB connection object (externally managed), or
+            - Path to DuckDB database file, or
+            - None (in-memory DB, internally managed).
+        threads (Optional[int]): Number of threads used for operations.
+
+    Examples:
         >>> dp = DuckTable("/path/to/parquet_dir")
         >>> df = dp.select("*", where="ds = '2025-01-01'")
         >>> dp.upsert_from_df(new_rows_df, keys=["id"], partition_by=["ds"])
@@ -526,7 +537,7 @@ class DuckTable:
             **kwargs,
         )
 
-    def upsert(self, df: pd.DataFrame, keys: list, partition_by: Optional[list] = None):
+    def upsert(self, df: pd.DataFrame, keys: list, partition_by: Optional[list] = None) -> None:
         """Upsert rows from DataFrame according to primary keys, overwrite existing rows."""
         if df.duplicated(subset=keys).any():
             raise ValueError("DataFrame contains duplicate rows based on keys.")
@@ -604,13 +615,18 @@ class DuckPQ:
     created for each table name, so you can query them using SQL on the shared
     DuckDB connection.
 
-    On initialization:
-        - A DuckDB connection is created or reused.
-        - All immediate subdirectories under `root_dir` are treated as tables.
-        - For each table directory, a DuckTable is instantiated and stored
-          in `self.tables[table_name]`.
+    Attributes:
+        root_path: Root directory for the Parquet database. Each immediate
+            subdirectory is treated as a table.
+        database: DuckDB database spec:
+            - DuckDBPyConnection instance: reuse this connection
+                (DuckPQ will not close it).
+            - String path: DuckDB file path, will call duckdb.connect.
+            - None: use in-memory DuckDB (":memory:").
+        config: Extra DuckDB connection config, merged into duckdb.connect.
+        threads: Number of DuckDB threads to set via "SET threads=...".
 
-    Typical usage:
+    Examples:
         >>> db = DuckPQ(root_dir="database", database="duckpq.duckdb", threads=4)
 
         # tables and schema are auto-discovered
@@ -643,10 +659,6 @@ class DuckPQ:
         ...     '''
         ... )
 
-    Attributes:
-        root_path: Root directory containing parquet table directories.
-        database: Shared DuckDB connection.
-        tables: Mapping table_name -> DuckTable instance.
     """
 
     def __init__(

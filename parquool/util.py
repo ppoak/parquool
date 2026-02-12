@@ -1110,6 +1110,11 @@ def generate_class_usage(
                 lines.append(f"- `{a['name']}`{typ}{desc}")
         lines.append("")
 
+    if "examples" in sec and cls_examples:
+        lines.append(f"{h2} Examples")
+        lines.append("\n".join(cls_examples))
+        lines.append("")
+
     if "methods" in sec and methods:
         lines.append(f"{h2} Methods")
         lines.append("")
