@@ -35,7 +35,7 @@ Key responsibilities:
 | `instructions` | `str` | High-level instructions for the underlying agent. |
 | `preset_prompts` | `dict, optional` | Dictionary of preset prompts for common tasks. |
 | `tools` | `List[agents.FunctionTool], optional` | List of tool descriptors or callables to add to the agent. |
-| `tool_use_behavior` | `str` | Strategy for how tools are used by the agent. |
+| `tool_use_behavior` | `str` | Strategy for how tools are used by the agent, choices between 'run_llm_again', 'stop_on_first_tool'. |
 | `handoffs` | `List[agents.Agent], optional` | List of handoff agents. |
 | `output_type` | `str, optional` | Optional output type annotation for the agent. |
 | `input_guardrails` | `List[agents.InputGuardrail], optional` | List of input guardrails to enforce. |
