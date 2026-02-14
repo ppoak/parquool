@@ -10,18 +10,26 @@ from typing import (
     Optional,
     Union,
     Callable,
-    Tuple,
+    Literal,
     AsyncIterator,
     TYPE_CHECKING,
 )
 
-
 import dotenv
 import agents
+import agents.mcp as amcp
 import openai
 from openai.types.responses import ResponseTextDeltaEvent, ResponseContentPartDoneEvent
 
-from .util import setup_logger
+from .util import (
+    setup_logger,
+    google_search,
+    read_url,
+    generate_usage,
+    notify_task,
+    proxy_request,
+)
+from .storage import DuckPQ, DuckTable
 
 if TYPE_CHECKING:
     import chromadb
@@ -540,6 +548,8 @@ class Agent:
         preset_prompts: dict = None,
         tools: List[agents.FunctionTool] = None,
         tool_use_behavior: str = "run_llm_again",
+        mcp_servers: Optional[List[amcp.MCPServer]] = None,
+        mcp_config: Optional[Dict] = None,
         handoffs: List[agents.Agent] = None,
         output_type: str = None,
         input_guardrails: List[agents.InputGuardrail] = None,
@@ -573,6 +583,8 @@ class Agent:
             preset_prompts (dict, optional): Dictionary of preset prompts for common tasks.
             tools (List[agents.FunctionTool], optional): List of tool descriptors or callables to add to the agent.
             tool_use_behavior (str): Strategy for how tools are used by the agent.
+            mcp_servers (Optional[List[mcp.MCPServer]]): Set MCPServer to use.
+            mcp_config (Optional[Dict]): Set MCPServer to use in dictonary format.
             handoffs (List[agents.Agent], optional): List of handoff agents.
             output_type (str, optional): Optional output type annotation for the agent.
             input_guardrails (List[agents.InputGuardrail], optional): List of input guardrails to enforce.
@@ -645,6 +657,8 @@ class Agent:
             output_type=output_type,
             tools=self.function_tools,
             tool_use_behavior=tool_use_behavior,
+            mcp_servers=mcp_servers or [],
+            mcp_config=mcp_config or {},
             handoffs=self.handoff_agents,
             model=model_name or os.getenv("OPENAI_MODEL_NAME") or "gpt-5",
             model_settings=self.model_settings,
@@ -1053,3 +1067,198 @@ class Agent:
                 session_id=session_id,
             )
         )
+
+
+class MCP:
+    """A lightweight MCP server wrapper for exposing `parquool` capabilities.
+
+    This class builds a `FastMCP` application and registers a set of built-in
+    `parquool` tools and auto-generated documentation resources (via
+    `parquool.generate_usage`).
+
+    Attributes:
+        name: The MCP server name shown to clients.
+        app: The underlying `FastMCP` application instance.
+    """
+
+    def __init__(self, name: str = "MCP", instructions: str = None):
+        """Initialize the MCP server and register tools/resources.
+
+        Args:
+            name: A human-readable server name.
+            instructions: Optional system instructions passed to `FastMCP`.
+                If not provided, a default instruction string is used.
+
+        Raises:
+            ImportError: If the `mcp` backend is not available. Install it via
+                `pip install "parquool[mcp]"`.
+        """
+        try:
+            from mcp.server import FastMCP
+        except:
+            raise ImportError(
+                'mcp backend not found, please install with `pip install "parquool[mcp]"`'
+            )
+        self.name = name
+        self.app = FastMCP(
+            name,
+            instructions=instructions
+            or "This is a MCP Server dedicated to provide template, tools, resources for `parquool`",
+        )
+        self._register()
+
+    def _register(self):
+        """Register built-in tools and documentation resources.
+
+        This method wires selected `parquool` functions as MCP tools and exposes
+        a set of `auto-doc://...` resources whose contents are generated on
+        demand using `parquool.generate_usage`.
+        """
+        # Built-in functions directly add as tool
+        self.app.tool(
+            description=generate_usage(
+                google_search, include_signature=False, include_sections=["summary"]
+            ),
+        )(google_search)
+        self.app.tool(
+            description=generate_usage(
+                read_url, include_signature=False, include_sections=["summary"]
+            )
+        )(read_url)
+
+        def generate_doc(
+            target: Literal[
+                "Agent",
+                "Collection",
+                "DuckPQ",
+                "DuckTable",
+                "google_search",
+                "notify_task",
+                "proxy_request",
+                "read_url",
+                "setup_logger",
+            ],
+        ):
+            """Generate documentation for a specified `parquool` target.
+
+            Args:
+                target: The target name to generate docs for. Must be one of:
+                    "Agent", "Collection", "DuckPQ", "DuckTable", "google_search",
+                    "notify_task", "proxy_request", "read_url", "setup_logger".
+
+            Returns:
+                A Markdown string generated by `parquool.generate_usage` for the
+                requested target.
+            """
+            target_dict = {
+                "Agent": Agent,
+                "Collection": Collection,
+                "DuckPQ": DuckPQ,
+                "DuckTable": DuckTable,
+                "google_search": google_search,
+                "notify_task": notify_task,
+                "proxy_request": proxy_request,
+                "read_url": read_url,
+                "setup_logger": setup_logger,
+            }
+            return generate_usage(target_dict[target])
+
+        self.app.tool(
+            description=generate_usage(
+                generate_doc, include_signature=False, include_sections=["summary"]
+            )
+        )(generate_doc)
+
+        # Built-in doc generated by `generate_usage`
+        self.app.resource(
+            name="Agent",
+            uri="auto-doc://agent",
+            description="Usage of `parquool.Agent`",
+            mime_type="text/markdown",
+        )(lambda: generate_usage(Agent))
+        self.app.resource(
+            name="Collection",
+            uri="auto-doc://collection",
+            description="Usage of `parquool.Collection`",
+            mime_type="text/markdown",
+        )(lambda: generate_usage(Collection))
+        self.app.resource(
+            name="DuckPQ",
+            uri="auto-doc://duckpq",
+            description="Usage of `parquool.DuckPQ`",
+            mime_type="text/markdown",
+        )(lambda: generate_usage(DuckPQ))
+        self.app.resource(
+            name="DuckTable",
+            uri="auto-doc://ducktable",
+            description="Usage of `parquool.DuckTable`",
+            mime_type="text/markdown",
+        )(lambda: generate_usage(DuckTable))
+        self.app.resource(
+            name="generate_usage",
+            uri="auto-doc://generate_usage",
+            description="Usage of `parquool.generate_usage`",
+            mime_type="text/markdown",
+        )(lambda: generate_usage(generate_usage))
+        self.app.resource(
+            name="google_search",
+            uri="auto-doc://google_search",
+            description="Usage of `parquool.google_search`",
+            mime_type="text/markdown",
+        )(lambda: generate_usage(google_search))
+        self.app.resource(
+            name="notify_task",
+            uri="auto-doc://notify_task",
+            description="Usage of `parquool.notify_task`",
+            mime_type="text/markdown",
+        )(lambda: generate_usage(notify_task))
+        self.app.resource(
+            name="proxy_request",
+            uri="auto-doc://proxy_request",
+            description="Usage of `parquool.proxy_request`",
+            mime_type="text/markdown",
+        )(lambda: generate_usage(proxy_request))
+        self.app.resource(
+            name="read_url",
+            uri="auto-doc://read_url",
+            description="Usage of `parquool.read_url`",
+            mime_type="text/markdown",
+        )(lambda: generate_usage(read_url))
+        self.app.resource(
+            name="setup_logger",
+            uri="auto-doc://setup_logger",
+            description="Usage of `parquool.setup_logger`",
+            mime_type="text/markdown",
+        )(lambda: generate_usage(setup_logger))
+
+    def run(self, transport: str = "stdio"):
+        """Run the MCP server.
+
+        Args:
+            transport: Transport type for running the server. Common values are
+                "stdio" (default) and "sse".
+        """
+        self.app.run(transport=transport)
+
+def run_mcp():
+    """CLI entry point for starting the Parquool MCP server.
+
+    This function parses command-line arguments and starts an `MCP` server.
+
+    Examples:
+        Start with stdio transport (default):
+
+        >>> run_mcp()
+
+        Start with SSE transport:
+
+        $ python -m <your_module> --transport sse
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Parquool MCP Server")
+    parser.add_argument("--transport", default="stdio", choices=["stdio", "sse"])
+    args = parser.parse_args()
+
+    server = MCP()
+    server.run(transport=args.transport)

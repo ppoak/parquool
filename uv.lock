@@ -1525,7 +1525,7 @@ wheels = [
 
 [[package]]
 name = "parquool"
-version = "0.0.13"
+version = "0.0.14"
 source = { editable = "." }
 dependencies = [
     { name = "dotenv" },
@@ -1541,32 +1541,32 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-knowledge = [
+agent = [
     { name = "chromadb" },
+    { name = "mcp" },
     { name = "pypdf" },
     { name = "python-docx" },
-]
-websearch = [
     { name = "serpapi" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "chromadb", marker = "extra == 'knowledge'", specifier = ">=1.1.0" },
+    { name = "chromadb", marker = "extra == 'agent'", specifier = ">=1.1.0" },
     { name = "dotenv", specifier = ">=0.8" },
     { name = "duckdb", specifier = ">=1.0" },
     { name = "joblib", specifier = ">=1.5" },
     { name = "markdown", specifier = ">=3.0" },
+    { name = "mcp", marker = "extra == 'agent'", specifier = ">=1.14.0" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "openai-agents", specifier = ">=0.2" },
     { name = "pandas", specifier = ">=2.0" },
-    { name = "pypdf", marker = "extra == 'knowledge'", specifier = ">=6.1.0" },
-    { name = "python-docx", marker = "extra == 'knowledge'", specifier = ">=1.2.0" },
+    { name = "pypdf", marker = "extra == 'agent'", specifier = ">=6.1.0" },
+    { name = "python-docx", marker = "extra == 'agent'", specifier = ">=1.2.0" },
     { name = "requests", specifier = ">=2.32" },
     { name = "retry", specifier = ">=0.9" },
-    { name = "serpapi", marker = "extra == 'websearch'", specifier = ">=0.1.0" },
+    { name = "serpapi", marker = "extra == 'agent'", specifier = ">=0.1.0" },
 ]
-provides-extras = ["knowledge", "websearch"]
+provides-extras = ["agent"]
 
 [[package]]
 name = "posthog"

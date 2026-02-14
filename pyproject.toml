@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parquool"
-version = "0.0.13"
+version = "0.0.14"
 description = "Parquool - A Python Library for SQL like parquet query"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
@@ -29,14 +29,21 @@ dependencies = [
     "retry>=0.9",
 ]
 
+[project.scripts]
+parquool-mcp = "parquool.agent:run_mcp"
+
 [project.optional-dependencies]
-knowledge = [
+agent = [
+    "serpapi>=0.1.0",
     "chromadb>=1.1.0",
     "pypdf>=6.1.0",
     "python-docx>=1.2.0",
-]
-websearch = [
+    "mcp>=1.14.0",
+    "chromadb>=1.1.0",
+    "pypdf>=6.1.0",
+    "python-docx>=1.2.0",
     "serpapi>=0.1.0",
+    "mcp>=1.14.0",
 ]
 
 [project.urls]

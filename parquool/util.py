@@ -1628,6 +1628,60 @@ def generate_usage(
     ] = None,
     heading_level: int = 2,
 ) -> str:
+    """Generate usage documentation for a class or callable.
+
+    This function generates comprehensive usage documentation for the given target,
+    which can be either a class or a callable (function/method). For classes, it
+    delegates to `generate_class_usage` with various filtering options. For
+    functions/callables, it delegates to `generate_function_usage`.
+
+    Args:
+        target: The target object to generate documentation for. Must be a callable or a class.
+        output_path: Optional file path to save the generated documentation.
+            If None, the documentation is returned as a string.
+        include_private: Whether to include private members (names starting with
+            '_') in the documentation. Defaults to False.
+        include_inherited: Whether to include inherited members from parent
+            classes. Defaults to False.
+        include_properties: Whether to include class properties in the
+            documentation. Defaults to True.
+        include_methods: Whether to include methods in the documentation.
+            Defaults to True.
+        method_kinds: Tuple of method types to include. Valid values are
+            'instance', 'class', and 'static'. Defaults to all three.
+        method_include: Optional list of method names to explicitly include.
+            If provided, only these methods will be documented.
+        method_exclude: Optional list of method names to explicitly exclude
+            from documentation.
+        attribute_include: Optional list of attribute names to explicitly
+            include in documentation.
+        attribute_exclude: Optional list of attribute names to explicitly
+            exclude from documentation.
+        sort_methods: How to sort methods in the output. Options are 'name'
+            (alphabetical), 'kind' (by method type), or 'none' (as found).
+            Defaults to 'name'.
+        render_tables: Whether to render documentation sections as formatted
+            tables. Defaults to True.
+        include_signature: Whether to include function/method signatures in
+            the documentation. Defaults to True.
+        include_sections: Which documentation sections to include. Options
+            are 'summary', 'description', 'attributes', 'methods', 'parameters',
+            'returns', 'raises', 'examples'. If None, all relevant sections
+            are included.
+        heading_level: The base heading level (number of #) to use for the
+            documentation. Defaults to 2.
+
+    Returns:
+        The generated usage documentation as a string.
+
+    Raises:
+        TypeError: If the target is neither a class nor a callable.
+
+    Note:
+        When generating documentation for classes, this function delegates to
+        `generate_class_usage`. For functions and callables, it delegates to
+        `generate_function_usage`.
+    """
     is_class = inspect.isclass(target)
     is_callable = callable(target)
     if not is_class and not is_callable:
@@ -1665,12 +1719,14 @@ def generate_usage(
 
 def google_search(
     query: str,
-    location: Literal["China", "United States", "Germany", "France"] = None,
-    country: str = None,
-    language: str = None,
-    to_be_searched: str = None,
-    start: str = None,
-    num: str = None,
+    location: Optional[
+        Literal["China", "United States", "Germany", "France"]
+    ] = "China",
+    country: str = "cn",
+    language: str = "zh-cn",
+    to_be_searched: Optional[str] = None,
+    start: str = "1",
+    num: str = "10",
 ):
     """
     Google search page result tool. When asked about a question, you can use this tool to get an original google search page result.
@@ -1749,13 +1805,13 @@ def google_search(
 
 def read_url(
     url_or_urls: Union[str, List],
-    engine: Literal["direct", "browser"] = None,
-    return_format: Literal["markdown", "html", "text", "screeshot"] = None,
+    engine: Literal["direct", "browser"] = "browser",
+    return_format: Literal["markdown", "html", "text", "screeshot"] = "markdown",
     with_links_summary: Literal["all", "true"] = "true",
     with_image_summary: Literal["all", "true"] = "true",
     retain_image: bool = False,
     do_not_track: bool = True,
-    set_cookie: str = None,
+    set_cookie: Optional[str] = None,
     max_length_each: int = 100000,
 ):
     """Fetch and summarize the readable content of one or more URLs via the r.jina.ai reader proxy.
