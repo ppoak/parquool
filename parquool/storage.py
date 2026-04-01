@@ -60,12 +60,13 @@ class DuckTable:
         database: Optional[Union[str, duckdb.DuckDBPyConnection]] = None,
         threads: Optional[int] = None,
     ):
-        """
+        """Initialize a DuckTable for querying a directory of Parquet files.
+
         Args:
             root_path (str): Directory path that stores the parquet dataset.
             name (Optional[str]): The view name. Defaults to directory basename.
             create (bool): If True, create the directory if it doesn't exist.
-            con (Optional[Union[str, duckdb.DuckDBPyConnection]]): Either:
+            database (Optional[Union[str, duckdb.DuckDBPyConnection]]): Either:
                 - DuckDB connection object (externally managed), or
                 - Path to DuckDB database file, or
                 - None (in-memory DB, internally managed).
@@ -368,12 +369,29 @@ class DuckTable:
     def execute(
         self, sql: str, params: Optional[Sequence[Any]] = None
     ) -> duckdb.DuckDBPyRelation:
-        """Execute a raw SQL query and return results as a DataFrame."""
+        """Execute a raw SQL query and return results as a DuckDB relation.
+
+        Args:
+            sql (str): SQL query to execute.
+            params (Optional[Sequence[Any]]): Optional bind parameters for the query.
+
+        Returns:
+            duckdb.DuckDBPyRelation: The DuckDB relation containing query results.
+        """
         return self.con.execute(sql, params or [])
 
     sql = execute
 
     def query(self, sql: str, params: Optional[Sequence[Any]] = None) -> pd.DataFrame:
+        """Execute a raw SQL query and return results as a pandas DataFrame.
+
+        Args:
+            sql (str): SQL query to execute.
+            params (Optional[Sequence[Any]]): Optional bind parameters for the query.
+
+        Returns:
+            pd.DataFrame: Query results as a pandas DataFrame.
+        """
         return self.execute(sql, params=params).df()
 
     @property
@@ -404,7 +422,22 @@ class DuckTable:
         offset: Optional[int] = None,
         distinct: bool = False,
     ) -> pd.DataFrame:
-        """Query current dataset with flexible SQL generated automatically."""
+        """Query the parquet dataset with flexible SQL generation.
+
+        Args:
+            columns: Column list or "*" for all columns.
+            where: Optional WHERE clause string.
+            params: Optional sequence of bind parameters for WHERE.
+            group_by: Optional GROUP BY columns or expression.
+            having: Optional HAVING clause.
+            order_by: Optional ORDER BY columns or expression.
+            limit: Optional row limit.
+            offset: Optional row offset.
+            distinct: Whether to select DISTINCT rows.
+
+        Returns:
+            pd.DataFrame: Query results as a pandas DataFrame.
+        """
         view_ident = DuckTable._quote_ident(self.view_name)
         col_sql = columns if isinstance(columns, str) else ", ".join(columns)
         sql_parts: List[str] = ["SELECT"]
@@ -444,7 +477,23 @@ class DuckTable:
         limit: Optional[int] = None,
         fill_value: Any = None,
     ) -> pd.DataFrame:
-        """Pivot the parquet dataset using DuckDB PIVOT statement."""
+        """Pivot the parquet dataset using DuckDB PIVOT statement.
+
+        Args:
+            index: Column(s) to use as row index.
+            columns: Column whose values will become column headers.
+            values: Column containing values to aggregate.
+            aggfunc: Aggregation function to use (default 'first').
+            where: Optional WHERE clause to filter before pivoting.
+            on_in: Optional list of values to include in IN clause for columns.
+            group_by: Optional GROUP BY columns.
+            order_by: Optional ORDER BY columns.
+            limit: Optional row limit.
+            fill_value: Value to use for missing cells after pivot.
+
+        Returns:
+            pd.DataFrame: Pivoted DataFrame.
+        """
         if isinstance(index, str):
             index_cols = [index]
         else:
@@ -509,7 +558,24 @@ class DuckTable:
         dropna: bool = True,
         **kwargs,
     ) -> pd.DataFrame:
-        """Wide pivot using Pandas pivot_table."""
+        """Wide pivot using pandas pivot_table.
+
+        Args:
+            index: Column(s) to use as row index.
+            columns: Column(s) to use as column headers.
+            values: Column(s) containing values to aggregate.
+            aggfunc: Aggregation function (default 'mean').
+            where: Optional WHERE clause to filter before pivoting.
+            params: Optional bind parameters for WHERE clause.
+            order_by: Optional ORDER BY columns.
+            limit: Optional row limit.
+            fill_value: Value to use for missing cells.
+            dropna: Whether to drop columns with all NA values.
+            **kwargs: Additional arguments passed to pandas.pivot_table.
+
+        Returns:
+            pd.DataFrame: Pivoted DataFrame using pandas pivot_table.
+        """
         select_cols: List[str] = []
         for part in (index, columns, values or []):
             if part is None:
@@ -552,7 +618,16 @@ class DuckTable:
         max_workers: int = 8,
         engine: str = "pyarrow",
     ) -> List[str]:
-        """Compact partition directories with multiple parquet files into single parquet file."""
+        """Compact partition directories with multiple parquet files into single parquet files.
+
+        Args:
+            compression (str): Compression codec to use ('zstd', 'snappy', 'gzip', etc.).
+            max_workers (int): Maximum number of parallel workers for compaction.
+            engine (str): Parquet engine to use ('pyarrow' or 'fastparquet').
+
+        Returns:
+            List[str]: List of relative partition paths that were compacted.
+        """
         if not self.root_path.exists():
             return []
 
@@ -627,7 +702,7 @@ class DuckPQ:
         threads: Number of DuckDB threads to set via "SET threads=...".
 
     Examples:
-        >>> db = DuckPQ(root_dir="database", database="duckpq.duckdb", threads=4)
+        >>> db = DuckPQ(root_path="database", database="duckpq.duckdb", threads=4)
 
         # tables and schema are auto-discovered
         >>> db.tables.keys()
@@ -738,8 +813,13 @@ class DuckPQ:
     # Public API: register DuckTable for further operations
     # ------------------------------------------------------------------ #
 
-    def registrable(self):
-        """Registrable table under root path"""
+    def registrable(self) -> List[str]:
+        """List unregistered table directories under the root path.
+
+        Returns:
+            List[str]: List of directory names that could be registered as tables
+                but are not currently tracked.
+        """
         tables = []
         for path in self.root_path.iterdir():
             if path.is_dir() and path.name not in self.tables:
@@ -747,7 +827,15 @@ class DuckPQ:
         return tables
 
     def register(self, name: Optional[str] = None) -> None:
-        """Register table directories under root_dir and attach them."""
+        """Register table directories under root_path as DuckTable instances.
+
+        If name is provided, only that specific directory is registered.
+        Otherwise, all subdirectories under root_path are scanned and registered.
+
+        Args:
+            name (Optional[str]): Specific table name to register. If None,
+                registers all subdirectories.
+        """
         if name is not None:
             dp = self._get_or_create_table(name)
             self.tables[name] = dp
@@ -900,6 +988,17 @@ class DuckPQ:
         max_workers: int = 8,
         engine: str = "pyarrow",
     ) -> List[str]:
+        """Compact partition directories of a Parquet-backed table into single parquet files.
+
+        Args:
+            table (str): Name of the table to compact.
+            compression (str): Compression codec to use ('zstd', 'snappy', 'gzip', etc.).
+            max_workers (int): Maximum number of parallel workers for compaction.
+            engine (str): Parquet engine to use ('pyarrow' or 'fastparquet').
+
+        Returns:
+            List[str]: List of relative partition paths that were compacted.
+        """
         dp = self._get_or_create_table(table)
         return dp.compact(
             compression=compression,
@@ -936,6 +1035,15 @@ class DuckPQ:
     sql = execute
 
     def query(self, sql: str, params: Optional[Sequence[Any]] = None) -> pd.DataFrame:
+        """Execute a raw SQL query and return results as a pandas DataFrame.
+
+        Args:
+            sql (str): SQL query to execute.
+            params (Optional[Sequence[Any]]): Optional bind parameters for the query.
+
+        Returns:
+            pd.DataFrame: Query results as a pandas DataFrame.
+        """
         return self.execute(sql, params=params).df()
 
     # ------------------------------------------------------------------ #

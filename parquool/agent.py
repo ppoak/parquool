@@ -50,7 +50,7 @@ class _ChromaVectorStore:
         self.collection = client.get_or_create_collection(name=name)
         self.embed_fn = embed_fn
 
-    def __len__(self):
+    def __len__(self) -> int:
         """Return the number of items stored in the underlying Chroma collection.
 
         Returns:
@@ -681,10 +681,20 @@ class Agent:
 
     # ----------------- Internal helpers -----------------
 
-    def __str__(self):
+    def __str__(self) -> str:
+        """Return string representation of the underlying agent.
+
+        Returns:
+            str: String representation of the agents.Agent instance.
+        """
         return str(self.agent)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Return detailed representation of the Agent wrapper.
+
+        Returns:
+            str: String representation.
+        """
         return self.__str__()
 
     # ----------------- Internal helpers -----------------
@@ -842,7 +852,12 @@ class Agent:
                     continue
         return items
 
-    def get_all_conversations(self) -> List:
+    def get_all_conversations(self) -> List[str]:
+        """Retrieve all conversation session IDs stored in the session database.
+
+        Returns:
+            List[str]: List of all session IDs that have conversation history.
+        """
         conn = self.session._get_connection()
         with self.session._lock if self.session._is_memory_db else threading.Lock():
             cursor = conn.execute(
@@ -902,11 +917,8 @@ class Agent:
         use_knowledge: Optional[bool] = None,
         collection_name: Optional[str] = None,
         session_id: str = None,
-    ) -> AsyncIterator:
-        """
-        Synchronously run a prompt using the agent inside an SQLite-backed session.
-
-        Defaults to using an ephemeral in-memory SQLite database unless a persistent db_path is provided.
+    ) -> agents.RunResult:
+        """Asynchronously run a prompt using the agent inside an SQLite-backed session.
 
         Args:
             prompt (str): Text prompt to run.
@@ -915,7 +927,7 @@ class Agent:
             session_id (str, optional): Session ID, if not specified, a uuid-4 string will be applied.
 
         Returns:
-            agents.RunResult: Result from agents.Runner.run execution (implementation-specific).
+            agents.RunResult: Result from agents.Runner.run execution.
         """
         use_knowledge = use_knowledge or True if self.collection else False
         prompt_to_run = self._maybe_augment_prompt(
@@ -977,21 +989,19 @@ class Agent:
         collection_name: Optional[str] = None,
         session_id: str = None,
     ):
-        """
-        Run a prompt with the agent and process the output in a streaming fashion asynchronously.
+        """Run a prompt with the agent and process output in a streaming fashion asynchronously.
 
-        This method runs the asynchronous stream internally and processed the yield output from `stream`.
+        This method runs the asynchronous stream internally and processes the yield output from `stream`,
+        printing streaming deltas to stdout.
 
         Args:
             prompt (str): Prompt text to run.
-            session_id (str, optional): Optional conversation session ID; generates new UUID if None.
-            db_path (str, optional): Path to SQLite DB file; defaults to ":memory:".
             use_knowledge (Optional[bool], optional): Whether to augment prompt from knowledge base.
             collection_name (Optional[str], optional): Name of the knowledge collection.
             session_id (str, optional): Session ID, if not specified, a uuid-4 string will be applied.
 
         Returns:
-            AsyncIterator
+            agents.RunResult: The result from the streamed run.
         """
 
         session_id = session_id or uuid.uuid4().hex
